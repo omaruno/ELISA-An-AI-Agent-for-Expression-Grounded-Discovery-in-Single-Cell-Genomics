@@ -92,12 +92,26 @@ output/
 ### Step 3: Launch the Interactive Chat
 
 Start the ELISA chat interface for interactive querying, analysis, and report generation.
-
 ```bash
 # Set your LLM API key (Groq is free)
 export GROQ_API_KEY=your-key-here
 
-# Launch ELISA
+# Launch ELISA (default settings — good for Groq free tier)
+python elisa_chat_v4.py --h5ad /path/to/dataset.h5ad --cluster-key cell_type
+
+# For larger models (GPT-4o, Claude) — increase token limits:
+export LLM_PROVIDER=openai
+export OPENAI_API_KEY=your-key
+export LLM_MAX_OUTPUT_TOKENS=4096
+export LLM_MAX_INPUT_CHARS=60000
+python elisa_chat_v4.py --h5ad /path/to/dataset.h5ad --cluster-key cell_type
+
+# For local/open-source models (Ollama, vLLM) — reduce limits:
+export LLM_PROVIDER=openai
+export OPENAI_API_KEY=dummy
+export LLM_MODEL=llama3:8b
+export LLM_MAX_OUTPUT_TOKENS=512
+export LLM_MAX_INPUT_CHARS=8000
 python elisa_chat_v4.py --h5ad /path/to/dataset.h5ad --cluster-key cell_type
 ```
 
@@ -107,6 +121,15 @@ python elisa_chat_v4.py --h5ad /path/to/dataset.h5ad --cluster-key cell_type
 |----------|-------------|---------|
 | `--h5ad` | Original `.h5ad` for Nature-style cell plots | `None` (plots disabled) |
 | `--cluster-key` | Cell type column (must match Steps 1–2) | `cell_type` |
+
+**Token and generation settings** (environment variables):
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `LLM_MAX_OUTPUT_TOKENS` | Max tokens in LLM response | `1024` |
+| `LLM_MAX_INPUT_CHARS` | Max chars in user prompt (~4 chars ≈ 1 token) | `18000` |
+| `LLM_MAX_CONTEXT_CHARS` | Context payload limit (auto: 2/3 of input) | `12000` |
+| `LLM_TEMPERATURE` | Sampling temperature | `0.2` |
 
 **Example session:**
 
