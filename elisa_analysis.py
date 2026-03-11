@@ -1,27 +1,12 @@
 #!/usr/bin/env python
 # ============================================================
-# ELISA – Analysis Module (v3 — FCD/Neuro + Lung Databases)
-# ============================================================
-#
-# Changes vs v2:
-#   - PATHWAY_GENESETS: added 18 new KEGG-named pathways for FCD
-#     (mTOR, PI3K-Akt, Parkinson, Alzheimer, ALS, OxPhos, Prion,
-#     TLR, JAK-STAT, Complement/coagulation, Chemokine, TNF,
-#     Glutamatergic/GABAergic synapse, Calcium signaling,
-#     Synaptic vesicle cycle, Necroptosis, Leukocyte transendothelial,
-#     FCD progenitor/balloon cell markers)
-#   - Expanded existing: Neurodegeneration, Cortical neuron identity,
-#     Reactive astrogliosis, Microglia activation, Angiogenesis, Fibrosis
-#   - LR_DATABASE: added glutamatergic, GABAergic, OPC/oligo,
-#     progenitor, endothelial LR pairs
-#   - All v1/v2 functions preserved unchanged
+# ELISA – Analysis Module 
 # ============================================================
 
 import os, json
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
-
 
 # ============================================================
 # BUILT-IN LIGAND-RECEPTOR DATABASE (expanded)
