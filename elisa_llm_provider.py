@@ -20,6 +20,9 @@ Configuration (environment variables):
   ANTHROPIC_API_KEY   = your Anthropic key       (required if provider=claude)
   LLM_MODEL           = override model name      (optional)
   LLM_MAX_SPEND_EUR   = max spending in EUR      (default: 1.0)
+  LLM_MAX_OUTPUT_TOKENS = max tokens in LLM response    (default: 1024)
+  LLM_MAX_INPUT_CHARS   = max chars in user prompt       (default: 18000 ≈ 4500 tokens)
+  LLM_TEMPERATURE       = sampling temperature           (default: 0.2)
 
 Safety:
   - Built-in spending estimator that REFUSES to make calls once the
@@ -136,6 +139,24 @@ class SpendingTracker:
 _MAX_SPEND = float(os.getenv("LLM_MAX_SPEND_EUR", "1.0"))
 _tracker = SpendingTracker(max_spend_eur=_MAX_SPEND)
 
+# ── Configurable token limits ──────────────────────────────────
+# Users can tune these via environment variables to match their
+# LLM provider's context window and budget.
+#
+# Examples:
+#   Free/small models (Llama 8B on Groq):
+#     LLM_MAX_OUTPUT_TOKENS=1024  LLM_MAX_INPUT_CHARS=18000
+#
+#   Large context models (GPT-4o, Claude Sonnet):
+#     LLM_MAX_OUTPUT_TOKENS=4096  LLM_MAX_INPUT_CHARS=60000
+#
+#   Local / open-source models (Ollama, vLLM):
+#     LLM_MAX_OUTPUT_TOKENS=512   LLM_MAX_INPUT_CHARS=8000
+
+LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "1024"))
+LLM_MAX_INPUT_CHARS = int(os.getenv("LLM_MAX_INPUT_CHARS", "18000"))
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+
 
 def get_spending_summary():
     """Get current spending summary string."""
@@ -183,6 +204,7 @@ def get_llm_client():
         client = anthropic.Anthropic(api_key=key)
         print(f"[LLM] Provider : {info['label']}")
         print(f"[LLM] Model    : {get_model_name()}")
+        print(f"[LLM] Tokens   : max_in={LLM_MAX_INPUT_CHARS} chars, max_out={LLM_MAX_OUTPUT_TOKENS} tokens, temp={LLM_TEMPERATURE}")
         print(f"[LLM] Spend cap: EUR {_MAX_SPEND:.2f} (set LLM_MAX_SPEND_EUR to change)")
         return client
 
@@ -206,6 +228,7 @@ def get_llm_client():
 
     print(f"[LLM] Provider : {info['label']}")
     print(f"[LLM] Model    : {get_model_name()}")
+    print(f"[LLM] Tokens   : max_in={LLM_MAX_INPUT_CHARS} chars, max_out={LLM_MAX_OUTPUT_TOKENS} tokens, temp={LLM_TEMPERATURE}")
     if info["cost_per_1m_input"] > 0:
         print(f"[LLM] Spend cap: EUR {_MAX_SPEND:.2f} (set LLM_MAX_SPEND_EUR to change)")
     else:
@@ -221,12 +244,12 @@ def _ask_anthropic(client, system_prompt, user_prompt, model, info):
     """Call the Anthropic Messages API (Claude)."""
     res = client.messages.create(
         model=model,
-        max_tokens=1024,
+        max_tokens=LLM_MAX_OUTPUT_TOKENS,
         system=system_prompt,
         messages=[
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.2,
+        temperature=LLM_TEMPERATURE,
     )
     # Extract text from content blocks
     text = ""
@@ -252,7 +275,8 @@ def _ask_openai_compat(client, system_prompt, user_prompt, model, info):
     res = client.chat.completions.create(
         model=model,
         messages=messages,
-        temperature=0.2,
+        temperature=LLM_TEMPERATURE,
+        max_tokens=LLM_MAX_OUTPUT_TOKENS,
     )
     # Track spending
     usage = getattr(res, 'usage', None)
@@ -271,16 +295,19 @@ def _ask_openai_compat(client, system_prompt, user_prompt, model, info):
     return res.choices[0].message.content.strip()
 
 
-def ask_llm(client, system_prompt, user_prompt, max_chars=18000,
+def ask_llm(client, system_prompt, user_prompt, max_chars=None,
             max_retries=5, initial_wait=10):
     """
     Send a prompt, return text. Includes:
-    - Prompt trimming
+    - Prompt trimming (configurable via LLM_MAX_INPUT_CHARS)
     - Spending cap check (BEFORE each call)
     - Auto-retry with exponential backoff on 429 / rate-limit errors
     - Token tracking after each call
     - Automatic dispatch to Anthropic or OpenAI-compatible API
     """
+    if max_chars is None:
+        max_chars = LLM_MAX_INPUT_CHARS
+
     info = get_provider_info()
 
     # Check budget BEFORE making the call
@@ -362,6 +389,9 @@ if __name__ == "__main__":
     print(f"Provider  : {LLM_PROVIDER}")
     print(f"Model     : {get_model_name()}")
     print(f"Spend cap : EUR {_MAX_SPEND:.2f}")
+    print(f"Max out   : {LLM_MAX_OUTPUT_TOKENS} tokens")
+    print(f"Max in    : {LLM_MAX_INPUT_CHARS} chars")
+    print(f"Temperature: {LLM_TEMPERATURE}")
     print(f"API style : {get_provider_info()['api_style']}")
 
     info = get_provider_info()
