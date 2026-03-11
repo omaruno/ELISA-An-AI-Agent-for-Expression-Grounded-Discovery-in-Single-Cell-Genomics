@@ -1,2 +1,2 @@
-ELISA — Embedding-Linked Interactive Single-cell Agent
+ELISA Embedding-Linked Interactive Single-cell Agent
 
