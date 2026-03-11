@@ -3,23 +3,6 @@
 """
 ELISA Embedding Pipeline v3 — Optimized for Hybrid Retrieval
 =============================================================
-Builds on v2 with targeted improvements for the hybrid router engine:
-
-KEY CHANGES from v2:
-  1. GENE-AWARE TEXT SUMMARIES: Includes top marker genes per cluster 
-     in the context text, organized by functional categories (TFs, 
-     receptors, ligands, etc.) — helps BioBERT link gene names to 
-     cell type contexts.
-  
-  2. INVERTED GENE INDEX: Pre-computes a gene→cluster mapping with
-     scores, stored in the .pt file. This lets the gene pipeline do
-     O(1) lookups instead of scanning all clusters.
-  
-  3. CLUSTER SYNONYM LIST: Stores alternative names for each cluster
-     to help the synonym matching in the retrieval engine.
-  
-  4. IDENTITY-WEIGHTED EMBEDDINGS: Uses separate alpha for identity
-     vs context, with tunable parameter saved in the .pt file.
 
 Usage:
     python create_embeddings_v3.py \
