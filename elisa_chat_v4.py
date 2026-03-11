@@ -20,7 +20,10 @@ import argparse
 from datetime import datetime
 from typing import List
 
-from elisa_llm_provider import get_llm_client, get_model_name, ask_llm as _provider_ask_llm
+from elisa_llm_provider import (
+    get_llm_client, get_model_name, ask_llm as _provider_ask_llm,
+    LLM_MAX_INPUT_CHARS,
+)
 
 from retrieval_engine_v4_hybrid import RetrievalEngine
 from elisa_report import ReportBuilder
@@ -66,7 +69,10 @@ SYSTEM_PROMPT = (
 )
 
 
-MAX_PROMPT_CHARS = 12000  # ~4000 tokens, safe for Groq free tier
+# Context payload limit: 2/3 of the total input char budget,
+# leaving room for system prompt + prompt template text.
+# Configurable via LLM_MAX_INPUT_CHARS env var in elisa_llm_provider.
+MAX_PROMPT_CHARS = int(os.getenv("LLM_MAX_CONTEXT_CHARS", str(LLM_MAX_INPUT_CHARS * 2 // 3)))
 
 def _trim_ctx(payload, max_chars=MAX_PROMPT_CHARS):
     """Trim payload JSON to fit within LLM token limits."""
