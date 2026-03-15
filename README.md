@@ -222,7 +222,6 @@ If you use ELISA in your research, please cite the preliminary version published
   journal={arXiv preprint arXiv:2603.11872},
   year={2026}
 }
----
 
-## License
+
 
