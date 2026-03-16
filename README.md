@@ -213,7 +213,7 @@ A built-in spending tracker with overestimated costs refuses calls once the limi
 
 ## Citation
 
-If you use ELISA in your research, please cite the preliminary version published at ICLR Workshop Generative AI in Genomics:
+If you use ELISA in your research, please cite the arXiv or the preliminary version published at ICLR Workshop Generative AI in Genomics:
 
 ```bibtex
 @article{coser2026elisa,
