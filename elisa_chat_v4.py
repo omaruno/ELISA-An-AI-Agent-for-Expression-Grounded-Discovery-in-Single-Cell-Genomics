@@ -38,6 +38,20 @@ except ImportError:
 
 
 # ============================================================
+# CONFIG
+# ============================================================
+
+PLOT_DIR = "elisa_plots"
+
+# Context budget for the dataset evidence blob.
+MAX_PROMPT_CHARS = 12000          # ~4000 tokens, safe for Groq free tier
+# Room for the instruction wrapper around that blob.
+PROMPT_OVERHEAD_CHARS = 3000
+# Hard ceiling applied to the fully assembled user prompt.
+MAX_LLM_CHARS = MAX_PROMPT_CHARS + PROMPT_OVERHEAD_CHARS
+
+
+# ============================================================
 # LLM
 # ============================================================
 
@@ -46,9 +60,21 @@ def get_llm():
 
 
 def ask_llm(client, system_prompt, user_prompt, model=None):
-    """Delegate to elisa_llm_provider.ask_llm which handles all providers
-    (Groq, Gemini, OpenAI, Claude) with spending cap and retry logic."""
-    return _provider_ask_llm(client, system_prompt, user_prompt)
+    if model is None:
+        model = get_model_name()
+    if len(user_prompt) > MAX_LLM_CHARS:
+        user_prompt = (user_prompt[:MAX_LLM_CHARS]
+                       + "\n\n[... truncated for length ...]")
+
+    res = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.2,
+    )
+    return res.choices[0].message.content.strip()
 
 
 def make_llm_func(client, system_prompt):
@@ -69,11 +95,6 @@ SYSTEM_PROMPT = (
 )
 
 
-# Context payload limit: 2/3 of the total input char budget,
-# leaving room for system prompt + prompt template text.
-# Configurable via LLM_MAX_INPUT_CHARS env var in elisa_llm_provider.
-MAX_PROMPT_CHARS = int(os.getenv("LLM_MAX_CONTEXT_CHARS", str(LLM_MAX_INPUT_CHARS * 2 // 3)))
-
 def _trim_ctx(payload, max_chars=MAX_PROMPT_CHARS):
     """Trim payload JSON to fit within LLM token limits."""
     trimmed = dict(payload)
@@ -90,7 +111,12 @@ def _trim_ctx(payload, max_chars=MAX_PROMPT_CHARS):
     # Trim retrieval gene evidence
     for r in trimmed.get("results", []):
         if "gene_evidence" in r and len(r["gene_evidence"]) > 5:
+            r = dict(r)
             r["gene_evidence"] = r["gene_evidence"][:5]
+        # 'genes' duplicates 'gene_evidence' in the compat engine — drop it
+        # so the same payload isn't sent to the model twice.
+        if "genes" in r and "gene_evidence" in r:
+            r.pop("genes", None)
     # Trim pathway scores
     if "scores" in trimmed and isinstance(trimmed["scores"], list):
         trimmed["scores"] = trimmed["scores"][:10]
@@ -165,7 +191,8 @@ Guidelines:
 - Highlight genes differentially expressed between conditions
 - Note genes upregulated in each condition
 - Discuss biological implications of condition-specific patterns
-- Be cautious: these are proxy estimates from metadata weights, not formal DE
+- Be cautious: cluster fold changes are compositional and no formal
+  differential-abundance or differential-expression test was run
 - Be concise and scientific
 """
 
@@ -177,6 +204,7 @@ def build_interaction_prompt(query, payload):
         "top_interactions": payload.get("interactions", [])[:20],
         "pathway_summary": payload.get("pathway_summary", [])[:10],
         "pair_summary": payload.get("pair_summary", [])[:10],
+        "caveat": payload.get("caveat"),
     }
     ctx = json.dumps(trimmed, indent=2, default=str)
     return f"""
@@ -193,7 +221,8 @@ Guidelines:
 - Explain the biological significance of key ligand-receptor pairs
 - Note which cell type pairs communicate most
 - Mention any unexpected interactions
-- Be cautious: these are expression-based predictions, not confirmed interactions
+- Be cautious: these are co-enrichment predictions from marker statistics,
+  not confirmed interactions, and no null model was applied
 - Be concise and scientific
 """
 
@@ -204,13 +233,14 @@ def build_proportion_prompt(query, payload):
         "total_cells": payload.get("total_cells"),
         "n_clusters": payload.get("n_clusters"),
         "top_clusters": payload.get("proportions", [])[:15],
+        "source": payload.get("source"),
         "mode": "proportions",
     }
     if "proportion_fold_changes" in payload:
         trimmed["proportion_fold_changes"] = payload["proportion_fold_changes"][:15]
     if "condition_column" in payload:
         trimmed["condition_column"] = payload["condition_column"]
-    # Condition proportions: just top 5 per condition
+    # Condition proportions: just top 8 per condition
     if "condition_proportions" in payload:
         cp = {}
         for cond, data in payload["condition_proportions"].items():
@@ -239,18 +269,17 @@ Guidelines:
 
 
 def build_pathway_prompt(query, payload):
-    # Trim: for "all pathways" mode, only send ranked summary + top 3 per pathway
-    trimmed = {"query": query, "metric": payload.get("metric")}
+    # Trim: for "all pathways" mode, only send the ranked summary
+    trimmed = {"query": query, "metric": payload.get("metric"),
+               "caveat": payload.get("caveat")}
 
     if "ranked" in payload:
-        # All-pathways mode: just send ranked list with top cluster per pathway
         trimmed["ranked_pathways"] = [
             {"pathway": p["pathway"], "top_cluster": p.get("top_cluster"),
              "top_score": p.get("top_score")}
             for p in payload.get("ranked", [])[:15]
         ]
     elif "scores" in payload:
-        # Single pathway mode: send top 10 clusters
         trimmed["pathway"] = payload.get("pathway")
         trimmed["genes_in_pathway"] = payload.get("genes_in_pathway", [])
         trimmed["top_clusters"] = payload.get("scores", [])[:10]
@@ -268,6 +297,8 @@ Guidelines:
 - Identify which cell types show highest pathway activity
 - Report the top contributing genes
 - Discuss biological relevance of pathway activation patterns
+- Note that scores derive from per-cluster marker statistics, not per-cell
+  expression, and are therefore an enrichment proxy
 - Be concise and scientific
 """
 
@@ -275,9 +306,6 @@ Guidelines:
 # ============================================================
 # VISUALIZATION HELPERS
 # ============================================================
-
-PLOT_DIR = "elisa_plots"
-
 
 def ensure_plot_dir():
     os.makedirs(PLOT_DIR, exist_ok=True)
@@ -295,90 +323,109 @@ def handle_viz_command(cmd, engine, last_payload, last_answer):
             print("[VIZ] No retrieval results. Run a query first.")
             return []
         saved = viz.auto_plot_retrieval(engine, last_payload,
-                                         save_dir=PLOT_DIR, method="umap")
+                                        save_dir=PLOT_DIR, method="umap")
 
     elif subcmd == "plot:landscape":
         space = args.lower() if args else "semantic"
         emb = engine.semantic_emb if space.startswith("sem") else engine.scgpt_emb
         label = "Semantic" if space.startswith("sem") else "scGPT"
+        if emb is None:
+            print(f"[VIZ] No {label} embeddings in this .pt file.")
+            return []
         hl = ([str(r["cluster_id"]) for r in last_payload.get("results", [])]
               if last_payload else None)
         p = f"{PLOT_DIR}/landscape_{label.lower()}.png"
         viz.plot_embedding_landscape(emb, engine.cluster_ids, method="umap",
-                                      highlight_ids=hl, title=f"{label} Embedding Landscape",
-                                      space_label=label, save_path=p)
+                                     highlight_ids=hl,
+                                     title=f"{label} Embedding Landscape",
+                                     space_label=label, save_path=p)
         viz.plt.close(); saved.append(p)
 
     elif subcmd == "plot:dual":
+        if engine.semantic_emb is None or engine.scgpt_emb is None:
+            print("[VIZ] Need both semantic and scGPT embeddings.")
+            return []
         hl = ([str(r["cluster_id"]) for r in last_payload.get("results", [])]
               if last_payload else None)
         p = f"{PLOT_DIR}/dual_embedding.png"
         viz.plot_dual_embedding(engine.semantic_emb, engine.scgpt_emb,
-                                 engine.cluster_ids, highlight_ids=hl, save_path=p)
+                                engine.cluster_ids, highlight_ids=hl, save_path=p)
         viz.plt.close(); saved.append(p)
 
     elif subcmd == "plot:heatmap":
         space = args.lower() if args else "semantic"
         emb = engine.semantic_emb if space.startswith("sem") else engine.scgpt_emb
         label = "Semantic" if space.startswith("sem") else "scGPT"
+        if emb is None:
+            print(f"[VIZ] No {label} embeddings in this .pt file.")
+            return []
         hl = ([str(r["cluster_id"]) for r in last_payload.get("results", [])]
               if last_payload else None)
         p = f"{PLOT_DIR}/heatmap_{label.lower()}.png"
         viz.plot_similarity_heatmap(emb, engine.cluster_ids, highlight_ids=hl,
-                                     title=f"{label} Similarity", save_path=p)
+                                    title=f"{label} Similarity", save_path=p)
         viz.plt.close(); saved.append(p)
 
     elif subcmd == "plot:genes":
-        if not last_payload: print("[VIZ] No results."); return []
+        if not last_payload:
+            print("[VIZ] No results."); return []
         p = f"{PLOT_DIR}/gene_evidence.png"
         viz.plot_gene_evidence(last_payload.get("results", []),
-                                title=f"Gene Evidence – {last_payload.get('query', '')[:50]}",
-                                save_path=p)
+                               title=f"Gene Evidence – {last_payload.get('query', '')[:50]}",
+                               save_path=p)
         viz.plt.close(); saved.append(p)
 
     elif subcmd == "plot:gene_heatmap":
-        if not last_payload: print("[VIZ] No results."); return []
+        if not last_payload:
+            print("[VIZ] No results."); return []
         metric = args if args in ("pct_in", "pct_out", "logfc") else "pct_in"
         p = f"{PLOT_DIR}/gene_cluster_heatmap.png"
         viz.plot_gene_cluster_heatmap(last_payload.get("results", []), metric=metric,
-                                       title=f"Gene × Cluster ({metric})", save_path=p)
+                                      title=f"Gene × Cluster ({metric})", save_path=p)
         viz.plt.close(); saved.append(p)
 
     elif subcmd == "plot:radar":
-        if not last_payload: print("[VIZ] No results."); return []
+        if not last_payload:
+            print("[VIZ] No results."); return []
         p = f"{PLOT_DIR}/radar.png"
         viz.plot_cluster_radar(last_payload.get("results", []),
-                                title=f"Profiles – {last_payload.get('query', '')[:50]}",
-                                save_path=p)
+                               title=f"Profiles – {last_payload.get('query', '')[:50]}",
+                               save_path=p)
         viz.plt.close(); saved.append(p)
 
     elif subcmd == "plot:waterfall":
-        if not last_payload: print("[VIZ] No results."); return []
+        if not last_payload:
+            print("[VIZ] No results."); return []
         mode = last_payload.get("mode", "semantic")
         key = "hybrid_similarity" if mode == "hybrid" else "semantic_similarity"
         p = f"{PLOT_DIR}/waterfall.png"
         viz.plot_similarity_waterfall(last_payload.get("results", []), sim_key=key,
-                                       title=f"Ranking – {mode.title()}", save_path=p)
+                                      title=f"Ranking – {mode.title()}", save_path=p)
         viz.plt.close(); saved.append(p)
 
     elif subcmd == "plot:scatter":
         if not last_payload or last_payload.get("mode") not in ("hybrid", "discovery"):
             print("[VIZ] Need hybrid/discovery results."); return []
+        if engine._last_sem_sims is None or engine._last_expr_sims is None:
+            print("[VIZ] No similarity diagnostics available for that query "
+                  "(needs both a semantic space and gene symbols in the query).")
+            return []
         p = f"{PLOT_DIR}/sem_vs_expr.png"
         viz.plot_sem_vs_expr_scatter(last_payload.get("results", []),
-                                      engine.cluster_ids, engine._last_sem_sims,
-                                      engine._last_expr_sims,
-                                      title=f"Sem vs Expr – {last_payload.get('query', '')[:50]}",
-                                      save_path=p)
+                                     engine.cluster_ids, engine._last_sem_sims,
+                                     engine._last_expr_sims,
+                                     title=f"Sem vs Expr – {last_payload.get('query', '')[:50]}",
+                                     save_path=p)
         viz.plt.close(); saved.append(p)
 
     elif subcmd == "plot:lambda_sweep":
         query = args if args else (last_payload.get("query", "") if last_payload else "")
-        if not query: print("[VIZ] Provide query."); return []
+        if not query:
+            print("[VIZ] Provide query."); return []
         sweep = engine.lambda_sweep(query)
         p = f"{PLOT_DIR}/lambda_sweep.png"
         viz.plot_lambda_sweep(sweep["lambdas"], sweep["coverages"],
-                               title=f"λ Sweep – {query[:50]}", save_path=p)
+                              title=f"λ Sweep – {query[:50]}", save_path=p)
         viz.plt.close(); saved.append(p)
 
     else:
@@ -411,7 +458,6 @@ def handle_h5ad_viz(cmd: str, adata, cluster_key: str = "cell_type",
         return []
 
     if subcmd == "plot:umap":
-        # Cell-level UMAP, optionally highlight clusters
         highlight = [c.strip() for c in args_str.split(",")] if args_str else None
         p = f"{plot_dir}/cell_umap.png"
         viz.plot_cell_umap(adata, cluster_key=cluster_key,
@@ -420,35 +466,30 @@ def handle_h5ad_viz(cmd: str, adata, cluster_key: str = "cell_type",
         viz.plt.close(); saved.append(p)
 
     elif subcmd == "plot:expr":
-        # Single gene expression UMAP
         if not args_str:
             print("[VIZ] Usage: plot:expr IFNG")
             return []
         gene = args_str.strip()
         p = f"{plot_dir}/expr_{gene}.png"
         try:
-            viz.plot_gene_expression_umap(adata, gene=gene,
-                                           save_path=p)
+            viz.plot_gene_expression_umap(adata, gene=gene, save_path=p)
             viz.plt.close(); saved.append(p)
         except ValueError as e:
             print(f"[VIZ] {e}")
 
     elif subcmd == "plot:dotplot":
-        # Dot plot for gene list
         if not args_str:
             print("[VIZ] Usage: plot:dotplot IFNG, CD69, HLA-E, KLRC1")
             return []
         genes = [g.strip() for g in args_str.split(",") if g.strip()]
         p = f"{plot_dir}/dotplot.png"
         try:
-            viz.plot_dotplot(adata, genes=genes, cluster_key=cluster_key,
-                              save_path=p)
+            viz.plot_dotplot(adata, genes=genes, cluster_key=cluster_key, save_path=p)
             viz.plt.close(); saved.append(p)
         except ValueError as e:
             print(f"[VIZ] {e}")
 
     elif subcmd == "plot:grid":
-        # Multi-gene expression grid
         if not args_str:
             print("[VIZ] Usage: plot:grid IFNG, CD69, HLA-E, KLRC1, IFIT1, MX1")
             return []
@@ -456,8 +497,7 @@ def handle_h5ad_viz(cmd: str, adata, cluster_key: str = "cell_type",
         p = f"{plot_dir}/expr_grid.png"
         try:
             viz.plot_gene_expression_grid(adata, genes=genes,
-                                           cluster_key=cluster_key,
-                                           save_path=p)
+                                          cluster_key=cluster_key, save_path=p)
             viz.plt.close(); saved.append(p)
         except ValueError as e:
             print(f"[VIZ] {e}")
@@ -472,85 +512,26 @@ def handle_h5ad_viz(cmd: str, adata, cluster_key: str = "cell_type",
 
 
 # ============================================================
-# MAIN LOOP
+# BANNER
 # ============================================================
 
-def main():
-    # ── ARGUMENT PARSING ───────────────────────────────────────
-    parser = argparse.ArgumentParser(description="ELISA v4 Chat Interface")
-    parser.add_argument("--h5ad", default=None,
-                        help="Path to .h5ad file for Nature-style cell plots")
-    parser.add_argument("--cluster-key", default="cell_type",
-                        help="obs column for cell types (default: cell_type)")
-    cli_args = parser.parse_args()
-
-    print("[ELISA] Initializing...")
-    engine = RetrievalEngine()
-    llm = get_llm()
-
-    # ── LOAD H5AD (optional, for Nature-style plots) ──────────
-    adata = None
-    cluster_key = cli_args.cluster_key
-    if cli_args.h5ad and HAS_SCANPY:
-        print(f"[ELISA] Loading h5ad: {cli_args.h5ad}")
-        adata = sc.read_h5ad(cli_args.h5ad)
-        # Remap ENSEMBL → gene symbols if needed
-        if adata.var_names[0].startswith("ENSG"):
-            if "feature_name" in adata.var.columns:
-                adata.var["ensembl_id"] = adata.var_names.copy()
-                adata.var_names = adata.var["feature_name"].astype(str).values
-                adata.var_names_make_unique()
-                print(f"[ELISA] Remapped ENSEMBL → gene symbols")
-        print(f"[ELISA] h5ad loaded: {adata.shape[0]} cells, "
-              f"{adata.shape[1]} genes, "
-              f"cluster_key='{cluster_key}'")
-        if "X_umap" not in adata.obsm:
-            print("[WARN] No X_umap found — running sc.tl.umap()...")
-            sc.pp.neighbors(adata, use_rep="X_pca" if "X_pca" in adata.obsm else None)
-            sc.tl.umap(adata)
-            print("[ELISA] UMAP computed.")
-    elif cli_args.h5ad and not HAS_SCANPY:
-        print("[WARN] scanpy not installed — Nature plots disabled")
-    else:
-        print("[ELISA] No --h5ad provided. Nature-style plots disabled.")
-        print("        Use: python elisa_chat_v4.py --h5ad /path/to/data.h5ad")
-
-    # Detect dataset capabilities
-    caps = engine.detect_capabilities()
-    ds_name = engine.cluster_ids[0].split()[0] if engine.cluster_ids else "Dataset"
-    report = ReportBuilder(dataset_name=ds_name)
-
-    last_payload = None
-    last_answer = None
-    last_plots = []
-
-    # Print capabilities
-    print(f"\n[DATASET] {engine.n} clusters loaded")
-    if caps["has_conditions"]:
-        print(f"[DATASET] Condition column: '{caps['condition_column']}' "
-              f"→ {caps['condition_values']}")
-        print(f"[DATASET] Comparative analysis: AVAILABLE")
-    else:
-        print(f"[DATASET] Comparative analysis: NOT AVAILABLE (no condition column)")
-    print(f"[DATASET] Interactions, proportions, pathways: AVAILABLE")
-
-    print("""
+BANNER = """
 ╔══════════════════════════════════════════════════════════════╗
-║                     ELISA v4 – Commands                     ║
+║                    ELISA v4.1 – Commands                     ║
 ╠══════════════════════════════════════════════════════════════╣
-║  RETRIEVAL                                                  ║
+║  RETRIEVAL                                                   ║
 ║    semantic: <text>        Semantic-only retrieval           ║
-║    hybrid: <text>          Hybrid (semantic + scGPT)         ║
+║    hybrid: <text>          Hybrid (semantic + expression)    ║
 ║    discover: <question>    Discovery mode                    ║
 ║                                                              ║
 ║  ANALYSIS                                                    ║
 ║    compare: <A> vs <B>     Comparative (condition A vs B)    ║
-║    compare: <A> vs <B> | <genes>  Compare specific genes    ║
-║    interactions:           All cell-cell interactions         ║
-║    interactions: <src> -> <tgt>  Directed interactions       ║
+║    compare: <A> vs <B> | <genes>   Compare specific genes    ║
+║    interactions            All cell-cell interactions        ║
+║    interactions: <s> -> <t>  Directed interactions           ║
 ║    proportions             Cell type proportions             ║
 ║    pathway: <name>         Score a specific pathway          ║
-║    pathway: all            Score all built-in pathways        ║
+║    pathway: all            Score all built-in pathways       ║
 ║                                                              ║
 ║  VISUALIZATION                                               ║
 ║    plot:auto               All plots for last query          ║
@@ -563,6 +544,7 @@ def main():
 ║    plot:waterfall          Similarity ranking                ║
 ║    plot:scatter            Sem vs expr scatter               ║
 ║    plot:lambda_sweep <q>   Lambda sweep                      ║
+║    autoplot [on|off]       Auto-plot after queries (off)     ║
 ║                                                              ║
 ║  NATURE-STYLE PLOTS (requires --h5ad)                        ║
 ║    plot:umap               Cell-level UMAP (all clusters)    ║
@@ -577,6 +559,7 @@ def main():
 ║    genes: <prefix>         Filter genes                      ║
 ║    metadata: <cluster>     Cluster metadata                  ║
 ║    cells: <cluster>        Cell IDs                          ║
+║    clusters                List cluster names                ║
 ║                                                              ║
 ║  REPORT                                                      ║
 ║    report                  Generate structured report (docx) ║
@@ -584,16 +567,121 @@ def main():
 ║    export                  Quick export (last result)        ║
 ║    quit                    Exit                              ║
 ╚══════════════════════════════════════════════════════════════╝
-""")
+"""
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+def main():
+    # ── ARGUMENT PARSING ───────────────────────────────────────
+    parser = argparse.ArgumentParser(description="ELISA v4.1 Chat Interface")
+    parser.add_argument("--h5ad", default=None,
+                        help="Path to .h5ad file for cell-level plots and "
+                             "proportion/comparative analysis")
+    parser.add_argument("--cluster-key", default="cell_type",
+                        help="obs column for cell types (default: cell_type)")
+    parser.add_argument("--base", required=True,
+                        help="Embedding directory containing the .pt model")
+    parser.add_argument("--pt-name", required=True,
+                        help="Filename of the fused/hybrid .pt model")
+    parser.add_argument("--cells-csv", default=None,
+                        help="Optional cell metadata CSV (alternative to --h5ad "
+                             "for proportions/conditions)")
+    parser.add_argument("--hybrid-lambda", type=float, default=0.5,
+                        help="Semantic weight for 'hybrid:' queries. "
+                             "0.0 = pure expression, 1.0 = pure semantic, "
+                             "0.5 = RRF fusion (default: 0.5)")
+    parser.add_argument("--autoplot", action="store_true",
+                        help="Generate plots automatically after every "
+                             "retrieval query. Off by default — use the plot: "
+                             "commands, or toggle with 'autoplot on' in-session.")
+    cli_args = parser.parse_args()
+
+    print("[ELISA] Initializing...")
+    engine = RetrievalEngine(base=cli_args.base, pt_name=cli_args.pt_name,
+                             cells_csv=cli_args.cells_csv)
+    llm = get_llm()
+
+    # ── LOAD H5AD ──────────────────────────────────────────────
+    adata = None
+    cluster_key = cli_args.cluster_key
+    if cli_args.h5ad and HAS_SCANPY:
+        print(f"[ELISA] Loading h5ad: {cli_args.h5ad}")
+        adata = sc.read_h5ad(cli_args.h5ad)
+        # Remap ENSEMBL → gene symbols if needed
+        if adata.var_names[0].startswith("ENSG"):
+            if "feature_name" in adata.var.columns:
+                adata.var["ensembl_id"] = adata.var_names.copy()
+                adata.var_names = adata.var["feature_name"].astype(str).values
+                adata.var_names_make_unique()
+                print("[ELISA] Remapped ENSEMBL → gene symbols")
+        print(f"[ELISA] h5ad loaded: {adata.shape[0]} cells, "
+              f"{adata.shape[1]} genes, "
+              f"cluster_key='{cluster_key}'")
+        if "X_umap" not in adata.obsm:
+            print("[WARN] No X_umap found — running sc.tl.umap()...")
+            sc.pp.neighbors(adata, use_rep="X_pca" if "X_pca" in adata.obsm else None)
+            sc.tl.umap(adata)
+            print("[ELISA] UMAP computed.")
+    elif cli_args.h5ad and not HAS_SCANPY:
+        print("[WARN] scanpy not installed — Nature plots disabled")
+    else:
+        print("[ELISA] No --h5ad provided. Nature-style plots disabled.")
+        print("        Use: python elisa_chat_v4.py --h5ad /path/to/data.h5ad")
+
+    # ── ATTACH h5ad TO ENGINE ──────────────────────────────────
+    # This is what makes proportions / compare / cells: use real per-cell data
+    # instead of whatever happens to be in metadata_per_cluster.
+    if adata is not None and hasattr(engine, "attach_adata"):
+        engine.attach_adata(adata, cluster_key=cluster_key)
+
+    # ── CAPABILITIES ───────────────────────────────────────────
+    caps = engine.detect_capabilities()
+    ds_name = os.path.splitext(os.path.basename(cli_args.pt_name))[0]
+    if not ds_name and engine.cluster_ids:
+        ds_name = str(engine.cluster_ids[0]).split()[0]
+    report = ReportBuilder(dataset_name=ds_name)
+
+    last_payload = None
+    last_answer = None
+    last_plots = []
+    pending_plots = []   # plots made before any analysis exists to attach them to
+    autoplot = cli_args.autoplot   # off unless --autoplot or 'autoplot on'
+
+    print(f"\n[DATASET] {engine.n} clusters loaded")
+    if caps.get("has_conditions"):
+        print(f"[DATASET] Condition column: '{caps['condition_column']}' "
+              f"→ {caps['condition_values']} "
+              f"(source: {caps.get('condition_source')})")
+        print("[DATASET] Comparative analysis: AVAILABLE")
+    else:
+        print("[DATASET] Comparative analysis: NOT AVAILABLE (no condition column)")
+    if caps.get("has_proportions"):
+        print(f"[DATASET] Proportions: AVAILABLE "
+              f"({caps.get('total_cells')} cells)")
+    else:
+        print("[DATASET] Proportions: NOT AVAILABLE (no per-cell counts)")
+    print("[DATASET] Interactions, pathways: AVAILABLE (marker-based proxies)")
+    print(f"[DATASET] hybrid: lambda_sem = {cli_args.hybrid_lambda}")
+    print(f"[DATASET] Auto-plot: {'ON' if autoplot else 'OFF'} "
+          f"(use plot: commands, or 'autoplot on')")
+
+    print(BANNER)
 
     while True:
         try:
             q = input("Query > ").strip()
         except (EOFError, KeyboardInterrupt):
+            print()
             break
         if not q:
             continue
         if q in ("quit", "exit"):
+            if report.entries:
+                print(f"[ELISA] {len(report.entries)} analyses in this session "
+                      f"were never written to a report.")
             break
 
         payload = None
@@ -601,228 +689,274 @@ def main():
         prompt = None
         entry_type = None
 
-        # ── VISUALIZATION ──────────────────────────────────────
-        if q.startswith("plot:"):
-            # Route Nature-style commands to h5ad handler
-            subcmd = q.split(None, 1)[0]
-            if subcmd in ("plot:umap", "plot:expr", "plot:dotplot", "plot:grid"):
-                plots = handle_h5ad_viz(q, adata, cluster_key=cluster_key,
-                                        plot_dir=PLOT_DIR)
-            else:
-                plots = handle_viz_command(q, engine, last_payload, last_answer)
-            last_plots.extend(plots)
-            # Attach plots to the most recent report entry
-            if plots and report.entries:
-                report.entries[-1]["plots"].extend(plots)
-            continue
-
-        # ── INFO ───────────────────────────────────────────────
-        elif q == "info":
-            caps = engine.detect_capabilities()
-            print(json.dumps(caps, indent=2, default=str))
-            print(f"\nClusters: {engine.cluster_ids}")
-            continue
-
-        # ── RETRIEVAL COMMANDS ─────────────────────────────────
-        elif q.startswith("semantic:"):
-            txt = q.split(":", 1)[1].strip()
-            payload = engine.query_semantic(txt, top_k=5, with_genes=True)
-            prompt = build_standard_prompt("semantic", txt, payload)
-            entry_type = "semantic"
-
-        elif q.startswith("hybrid:"):
-            txt = q.split(":", 1)[1].strip()
-            payload = engine.query_hybrid(txt, top_k=5, lambda_sem=0.0,
-                                           pre_k=40, gamma=2.5, with_genes=True)
-            prompt = build_standard_prompt("hybrid", txt, payload)
-            entry_type = "hybrid"
-
-        elif q.startswith("discover:"):
-            txt = q.split(":", 1)[1].strip()
-            payload = engine.discover(txt, top_k=5, lambda_sem=0.5,
-                                       pre_k=40, gamma=2.5)
-            prompt = build_discovery_prompt(txt, payload)
-            entry_type = "discovery"
-
-        # ── COMPARE ────────────────────────────────────────────
-        elif q.startswith("compare:"):
-            txt = q.split(":", 1)[1].strip()
-            # Parse: "CF vs Control" or "CF vs Control | IFNG, CD69"
-            genes = None
-            if "|" in txt:
-                txt, gene_str = txt.split("|", 1)
-                genes = [g.strip() for g in gene_str.split(",") if g.strip()]
-                txt = txt.strip()
-
-            parts = txt.lower().split(" vs ")
-            if len(parts) != 2:
-                print("[ERROR] Format: compare: <A> vs <B>")
-                print("        compare: <A> vs <B> | gene1, gene2, gene3")
+        # Everything below runs inside a guard so that one failed command
+        # does not end the session and discard accumulated report entries.
+        try:
+            # ── VISUALIZATION ──────────────────────────────────
+            if q.startswith("plot:"):
+                subcmd = q.split(None, 1)[0]
+                if subcmd in ("plot:umap", "plot:expr", "plot:dotplot", "plot:grid"):
+                    plots = handle_h5ad_viz(q, adata, cluster_key=cluster_key,
+                                            plot_dir=PLOT_DIR)
+                else:
+                    plots = handle_viz_command(q, engine, last_payload, last_answer)
+                last_plots.extend(plots)
+                if plots:
+                    if report.entries:
+                        report.entries[-1]["plots"].extend(plots)
+                    else:
+                        # Nothing to attach to yet — hold for the next analysis
+                        pending_plots.extend(plots)
                 continue
 
-            group_a = parts[0].strip()
-            group_b = parts[1].strip()
-
-            # Match against actual condition values (case-insensitive)
-            caps = engine.detect_capabilities()
-            if caps["has_conditions"]:
-                cond_vals = caps["condition_values"]
-                for cv in cond_vals:
-                    if cv.lower() == group_a:
-                        group_a = cv
-                    if cv.lower() == group_b:
-                        group_b = cv
-
-            payload = engine.compare(group_a, group_b, genes=genes)
-            if "error" in payload:
-                print(f"[ERROR] {payload['error']}")
+            # ── INFO ───────────────────────────────────────────
+            elif q == "info":
+                print(json.dumps(engine.detect_capabilities(), indent=2, default=str))
                 continue
-            prompt = build_compare_prompt(payload.get("query", txt), payload)
-            entry_type = "compare"
 
-        # ── INTERACTIONS ───────────────────────────────────────
-        elif q.startswith("interactions"):
-            txt = q.split(":", 1)[1].strip() if ":" in q else ""
-            src = None
-            tgt = None
-            if "->" in txt:
-                parts = txt.split("->")
-                src = parts[0].strip() if parts[0].strip() else None
-                tgt = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
-            elif txt:
-                src = txt  # single source
+            elif q == "clusters":
+                for i, cid in enumerate(engine.cluster_ids, 1):
+                    print(f"  {i}. {cid}")
+                continue
 
-            payload = engine.interactions(source=src, target=tgt)
-            prompt = build_interaction_prompt(
-                payload.get("query", "Cell-cell interactions"), payload)
-            entry_type = "interactions"
+            elif q.startswith("autoplot"):
+                arg = q.split(None, 1)[1].strip().lower() if " " in q else ""
+                if arg in ("on", "off"):
+                    autoplot = (arg == "on")
+                elif arg:
+                    print("[ERROR] Usage: autoplot [on|off]")
+                    continue
+                print(f"[ELISA] Auto-plot is {'ON' if autoplot else 'OFF'}")
+                continue
 
-        # ── PROPORTIONS ────────────────────────────────────────
-        elif q.startswith("proportions"):
-            payload = engine.proportions()
-            prompt = build_proportion_prompt(
-                payload.get("query", "Cell type proportions"), payload)
-            entry_type = "proportions"
+            # ── RETRIEVAL COMMANDS ─────────────────────────────
+            elif q.startswith("semantic:"):
+                txt = q.split(":", 1)[1].strip()
+                if not txt:
+                    print("[ERROR] Usage: semantic: <text>")
+                    continue
+                payload = engine.query_semantic(txt, top_k=5, with_genes=True)
+                prompt = build_standard_prompt("semantic", txt, payload)
+                entry_type = "semantic"
 
-        # ── PATHWAY ────────────────────────────────────────────
-        elif q.startswith("pathway:"):
-            txt = q.split(":", 1)[1].strip()
-            if txt.lower() == "all":
-                payload = engine.pathway()
+            elif q.startswith("hybrid:"):
+                txt = q.split(":", 1)[1].strip()
+                if not txt:
+                    print("[ERROR] Usage: hybrid: <text>")
+                    continue
+                payload = engine.query_hybrid(txt, top_k=5,
+                                              lambda_sem=cli_args.hybrid_lambda,
+                                              pre_k=40, gamma=2.5, with_genes=True)
+                prompt = build_standard_prompt("hybrid", txt, payload)
+                entry_type = "hybrid"
+
+            elif q.startswith("discover:"):
+                txt = q.split(":", 1)[1].strip()
+                if not txt:
+                    print("[ERROR] Usage: discover: <question>")
+                    continue
+                payload = engine.discover(txt, top_k=5, lambda_sem=0.5,
+                                          pre_k=40, gamma=2.5)
+                prompt = build_discovery_prompt(txt, payload)
+                entry_type = "discovery"
+
+            # ── COMPARE ────────────────────────────────────────
+            elif q.startswith("compare:"):
+                txt = q.split(":", 1)[1].strip()
+                genes = None
+                if "|" in txt:
+                    txt, gene_str = txt.split("|", 1)
+                    genes = [g.strip() for g in gene_str.split(",") if g.strip()]
+                    txt = txt.strip()
+
+                parts = txt.lower().split(" vs ")
+                if len(parts) != 2:
+                    print("[ERROR] Format: compare: <A> vs <B>")
+                    print("        compare: <A> vs <B> | gene1, gene2, gene3")
+                    continue
+
+                group_a = parts[0].strip()
+                group_b = parts[1].strip()
+
+                caps = engine.detect_capabilities()
+                if caps.get("has_conditions"):
+                    for cv in caps["condition_values"]:
+                        if str(cv).lower() == group_a:
+                            group_a = cv
+                        if str(cv).lower() == group_b:
+                            group_b = cv
+
+                payload = engine.compare(group_a, group_b, genes=genes)
+                prompt = build_compare_prompt(payload.get("query", txt), payload)
+                entry_type = "compare"
+
+            # ── INTERACTIONS ───────────────────────────────────
+            elif q.startswith("interactions"):
+                txt = q.split(":", 1)[1].strip() if ":" in q else ""
+                src = None
+                tgt = None
+                if "->" in txt:
+                    parts = txt.split("->")
+                    src = parts[0].strip() or None
+                    tgt = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+                elif txt:
+                    src = txt
+
+                payload = engine.interactions(source=src, target=tgt)
+                if payload.get("n_total") == 0:
+                    print(f"[INFO] {payload.get('note', 'No interactions found.')}")
+                prompt = build_interaction_prompt(
+                    payload.get("query", "Cell-cell interactions"), payload)
+                entry_type = "interactions"
+
+            # ── PROPORTIONS ────────────────────────────────────
+            elif q.startswith("proportions"):
+                payload = engine.proportions()
+                prompt = build_proportion_prompt(
+                    payload.get("query", "Cell type proportions"), payload)
+                entry_type = "proportions"
+
+            # ── PATHWAY ────────────────────────────────────────
+            elif q.startswith("pathway:"):
+                txt = q.split(":", 1)[1].strip()
+                if txt.lower() in ("all", ""):
+                    payload = engine.pathway()
+                else:
+                    payload = engine.pathway(pathway_name=txt)
+                prompt = build_pathway_prompt(payload.get("query", txt), payload)
+                entry_type = "pathway"
+
+            # ── DATA COMMANDS ──────────────────────────────────
+            elif q.startswith("genes"):
+                prefix = q.split(":", 1)[1].strip() if ":" in q else None
+                all_genes = set()
+                for _cid, stats in engine.gene_stats.items():
+                    all_genes.update(stats.keys())
+                if prefix:
+                    matched = sorted(g for g in all_genes
+                                     if g.upper().startswith(prefix.upper()))
+                else:
+                    matched = sorted(all_genes)
+                print(f"{len(matched)} genes"
+                      + (f" matching '{prefix}'" if prefix else ""))
+                print(", ".join(matched[:100]))
+                if len(matched) > 100:
+                    print(f"  ... and {len(matched) - 100} more")
+                continue
+
+            elif q.startswith("metadata:"):
+                cid = q.split(":", 1)[1].strip()
+                print(json.dumps(engine.get_metadata(cid), indent=2, default=str))
+                continue
+
+            elif q.startswith("cells:"):
+                cid = q.split(":", 1)[1].strip()
+                cells = engine.get_cells(cid)
+                if not cells:
+                    print(f"[INFO] No cell IDs available for '{cid}'. "
+                          f"Start ELISA with --h5ad or --cells-csv.")
+                else:
+                    print(f"{len(cells)} cells:", cells[:20])
+                continue
+
+            # ── REPORT ─────────────────────────────────────────
+            elif q.startswith("report"):
+                if not report.entries:
+                    print("[REPORT] No analyses collected yet.")
+                    continue
+                fmt = q.split(":", 1)[1].strip().lower() if ":" in q else "docx"
+                llm_fn = make_llm_func(llm, SYSTEM_PROMPT)
+                if fmt == "md":
+                    path = report.generate_markdown(llm_func=llm_fn)
+                else:
+                    path = report.generate_docx(llm_func=llm_fn)
+                print(f"[REPORT] Generated: {path}")
+                print(f"[REPORT] Contains {len(report.entries)} analysis entries")
+                continue
+
+            elif q.startswith("export"):
+                if last_payload and last_answer:
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    fn = f"elisa_export_{ts}.json"
+                    with open(fn, "w") as f:
+                        json.dump({
+                            "payload": last_payload,
+                            "answer": last_answer,
+                            "plots": last_plots,
+                        }, f, indent=2, default=str)
+                    print(f"[EXPORTED] {fn}")
+                else:
+                    print("[EXPORT] No results to export.")
+                continue
+
             else:
-                payload = engine.pathway(pathway_name=txt)
+                print("[ERROR] Unknown command. See the command list above.")
+                continue
 
-            if "error" in payload:
+            # ── PAYLOAD ERROR CHECK ────────────────────────────
+            # Applied uniformly, so an engine-level error never reaches the LLM
+            # dressed up as evidence.
+            if isinstance(payload, dict) and "error" in payload:
                 print(f"[ERROR] {payload['error']}")
                 if "available" in payload:
-                    print("Available pathways:")
-                    for pw in payload["available"]:
-                        print(f"  - {pw}")
+                    print("Available:")
+                    for item in payload["available"]:
+                        print(f"  - {item}")
                 continue
-            prompt = build_pathway_prompt(
-                payload.get("query", txt), payload)
-            entry_type = "pathway"
 
-        # ── DATA COMMANDS ──────────────────────────────────────
-        elif q.startswith("genes"):
-            prefix = q.split(":", 1)[1].strip() if ":" in q else None
-            all_genes = set()
-            for cid, stats in engine.gene_stats.items():
-                all_genes.update(stats.keys())
-            if prefix:
-                matched = sorted(g for g in all_genes if g.upper().startswith(prefix.upper()))
-            else:
-                matched = sorted(all_genes)
-            print(f"{len(matched)} genes" + (f" matching '{prefix}'" if prefix else ""))
-            print(", ".join(matched[:100]))
-            if len(matched) > 100:
-                print(f"  ... and {len(matched) - 100} more")
+            # ── LLM CALL ───────────────────────────────────────
+            if prompt and payload:
+                answer = ask_llm(llm, SYSTEM_PROMPT, prompt)
+                last_payload = payload
+                last_answer = answer
+                last_plots = []
+
+                if (autoplot
+                        and entry_type in ("semantic", "hybrid", "discovery")
+                        and payload.get("results")):
+                    ensure_plot_dir()
+                    try:
+                        auto_plots = viz.auto_plot_retrieval(
+                            engine, payload, save_dir=PLOT_DIR, method="umap")
+                        last_plots.extend(auto_plots)
+                        viz.plt.close("all")
+                    except Exception as e:
+                        print(f"[VIZ] Auto-plot failed: {e}")
+
+                attach = last_plots + pending_plots
+                pending_plots = []
+
+                report.add_entry(
+                    entry_type=entry_type,
+                    query=payload.get("query", q),
+                    payload=payload,
+                    answer=answer,
+                    plots=attach,
+                )
+
+                print("\n" + textwrap.fill(answer, width=100))
+                print("-" * 100)
+
+                if attach:
+                    print(f"[VIZ] {len(attach)} plots attached in {PLOT_DIR}/")
+
+                print(f"[SESSION] {len(report.entries)} analyses collected. "
+                      f"Type 'report' to generate.")
+
+        except KeyboardInterrupt:
+            print("\n[ELISA] Command interrupted. Session and collected "
+                  "analyses are preserved.")
+            continue
+        except Exception as e:
+            print(f"\n[ERROR] Command failed: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            print(f"[ELISA] Session preserved — {len(report.entries)} analyses "
+                  f"still collected.")
             continue
 
-        elif q.startswith("metadata:"):
-            cid = q.split(":", 1)[1].strip()
-            print(json.dumps(engine.get_metadata(cid), indent=2))
-            continue
 
-        elif q.startswith("cells:"):
-            cid = q.split(":", 1)[1].strip()
-            cells = engine.get_cells(cid)
-            print(f"{len(cells)} cells:", cells[:20])
-            continue
-
-        # ── REPORT ─────────────────────────────────────────────
-        elif q.startswith("report"):
-            fmt = "docx"
-            if ":" in q:
-                fmt = q.split(":", 1)[1].strip().lower()
-
-            llm_fn = make_llm_func(llm, SYSTEM_PROMPT)
-
-            if fmt == "md":
-                path = report.generate_markdown(llm_func=llm_fn)
-            else:
-                path = report.generate_docx(llm_func=llm_fn)
-
-            print(f"[REPORT] Generated: {path}")
-            print(f"[REPORT] Contains {len(report.entries)} analysis entries")
-            continue
-
-        elif q.startswith("export"):
-            if last_payload and last_answer:
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                fn = f"elisa_export_{ts}.json"
-                with open(fn, "w") as f:
-                    json.dump({
-                        "payload": last_payload,
-                        "answer": last_answer,
-                        "plots": last_plots,
-                    }, f, indent=2, default=str)
-                print(f"[EXPORTED] {fn}")
-            else:
-                print("[EXPORT] No results to export.")
-            continue
-
-        else:
-            print("[ERROR] Unknown command. See the command list above.")
-            continue
-
-        # ── LLM CALL ──────────────────────────────────────────
-        if prompt and payload:
-            answer = ask_llm(llm, SYSTEM_PROMPT, prompt)
-            last_payload = payload
-            last_answer = answer
-            last_plots = []
-
-            # Auto-generate plots for retrieval-type analyses
-            if entry_type in ("semantic", "hybrid", "discovery") and payload.get("results"):
-                ensure_plot_dir()
-                try:
-                    auto_plots = viz.auto_plot_retrieval(
-                        engine, payload, save_dir=PLOT_DIR, method="umap")
-                    last_plots.extend(auto_plots)
-                    viz.plt.close("all")
-                except Exception as e:
-                    print(f"[VIZ] Auto-plot failed: {e}")
-
-            # Add to report builder (with plots attached)
-            report.add_entry(
-                entry_type=entry_type,
-                query=payload.get("query", q),
-                payload=payload,
-                answer=answer,
-                plots=last_plots,
-            )
-
-            print("\n" + textwrap.fill(answer, width=100))
-            print("-" * 100)
-
-            if last_plots:
-                print(f"[VIZ] {len(last_plots)} plots auto-generated in {PLOT_DIR}/")
-
-            # Print report counter
-            print(f"[SESSION] {len(report.entries)} analyses collected. "
-                  f"Type 'report' to generate.")
-
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
