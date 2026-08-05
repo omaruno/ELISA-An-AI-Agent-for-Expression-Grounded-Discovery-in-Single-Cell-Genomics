@@ -1,31 +1,40 @@
 #!/usr/bin/env python
 # ============================================================
-# ELISA – LLM Chat Interface v4
+# ELISA – LLM Chat Interface v4.2
 # ============================================================
-# New in v4:
-#   - Comparative analysis (compare:)
-#   - Cell-cell interactions (interactions:)
-#   - Proportion analysis (proportions)
-#   - Pathway scoring (pathway:)
-#   - Structured report generation (report)
-#   - Dataset capability auto-detection (info)
-#   - All analysis results auto-added to report builder
+# Changes vs v4.1:
+#   - Imports the compat engine (the v3 shim alone lacks half the surface)
+#   - hybrid: now performs TRUE late fusion (RRF) in the engine; the
+#     --hybrid-lambda flag is the semantic fusion weight
+#   - union: exposes the additive union strategy from the manuscript
+#   - discover: dedicated system prompt, per-section budget, max_tokens,
+#     and a completion pass if any of the four sections is missing
+#   - Grounding guidelines moved BEFORE the evidence blob, so truncation
+#     can never drop the instructions
+#   - `traceback` imported (the crash-proof loop was raising NameError)
+#   - Removed duplicated __main__ block
 # ============================================================
 
 import os
-import sys
+import re
 import json
 import textwrap
+import traceback
 import argparse
 from datetime import datetime
 from typing import List
 
-from elisa_llm_provider import (
-    get_llm_client, get_model_name, ask_llm as _provider_ask_llm,
-    LLM_MAX_INPUT_CHARS,
-)
+from elisa_llm_provider import get_llm_client, get_model_name
 
-from retrieval_engine_v4_hybrid import RetrievalEngine
+# Optional: some builds of elisa_llm_provider export a character budget.
+# It is not required — fall back to the local constant if absent.
+try:
+    from elisa_llm_provider import LLM_MAX_INPUT_CHARS as _PROVIDER_MAX_CHARS
+except ImportError:
+    _PROVIDER_MAX_CHARS = None
+
+# IMPORTANT: the compat layer, not the bare v3 shim.
+from elisa_engine_compat import RetrievalEngine
 from elisa_report import ReportBuilder
 import elisa_viz as viz
 
@@ -43,12 +52,17 @@ except ImportError:
 
 PLOT_DIR = "elisa_plots"
 
-# Context budget for the dataset evidence blob.
-MAX_PROMPT_CHARS = 12000          # ~4000 tokens, safe for Groq free tier
+# Context budget for the dataset evidence blob (~3,000 tokens).
+MAX_PROMPT_CHARS = 12000
 # Room for the instruction wrapper around that blob.
-PROMPT_OVERHEAD_CHARS = 3000
-# Hard ceiling applied to the fully assembled user prompt.
+PROMPT_OVERHEAD_CHARS = 6000
+# Hard ceiling applied to the fully assembled user prompt (~4,500 tokens).
 MAX_LLM_CHARS = MAX_PROMPT_CHARS + PROMPT_OVERHEAD_CHARS
+if _PROVIDER_MAX_CHARS:
+    MAX_LLM_CHARS = min(MAX_LLM_CHARS, int(_PROVIDER_MAX_CHARS))
+
+DEFAULT_MAX_TOKENS = 1024
+DISCOVERY_MAX_TOKENS = 3072
 
 
 # ============================================================
@@ -59,7 +73,8 @@ def get_llm():
     return get_llm_client()
 
 
-def ask_llm(client, system_prompt, user_prompt, model=None):
+def ask_llm(client, system_prompt, user_prompt, model=None,
+            max_tokens=DEFAULT_MAX_TOKENS):
     if model is None:
         model = get_model_name()
     if len(user_prompt) > MAX_LLM_CHARS:
@@ -73,6 +88,7 @@ def ask_llm(client, system_prompt, user_prompt, model=None):
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.2,
+        max_tokens=max_tokens,
     )
     return res.choices[0].message.content.strip()
 
@@ -91,35 +107,70 @@ def make_llm_func(client, system_prompt):
 SYSTEM_PROMPT = (
     "You are ELISA, an expert assistant for single-cell biology. "
     "Never hallucinate. Always ground claims strictly in provided data. "
+    "Do not introduce external literature and do not infer causality. "
     "Be concise and scientific."
 )
+
+# Discovery mode deliberately ALLOWS general knowledge, but only inside
+# section 2, and requires the four-section structure. Using SYSTEM_PROMPT
+# here would forbid section 2 and cause the model to truncate 3 and 4.
+DISCOVERY_SYSTEM_PROMPT = (
+    "You are ELISA operating in DISCOVERY mode.\n"
+    "You MUST always output exactly four numbered sections, in this order, "
+    "using these exact headers, even if a section must be brief:\n"
+    "1. DATASET EVIDENCE — clusters, genes and scores taken ONLY from the "
+    "provided dataset context. Never invent a gene, cluster or number.\n"
+    "2. ESTABLISHED BIOLOGY — what those genes and cell types are generally "
+    "known to do, from your own knowledge. Do NOT cite the dataset here.\n"
+    "3. CONSISTENCY ANALYSIS — state explicitly what MATCHES established "
+    "biology and what is UNEXPECTED or CONTEXT-SHIFTED.\n"
+    "4. CANDIDATE NOVEL HYPOTHESES — cautious hypotheses grounded in the "
+    "mismatches from section 3. Use probabilistic language "
+    "('may', 'is consistent with', 'could indicate'). Never claim causality.\n"
+    "Never stop before section 4 is written."
+)
+
+DISCOVERY_SECTION_KEYS = [
+    ("1", "DATASET EVIDENCE"),
+    ("2", "ESTABLISHED BIOLOGY"),
+    ("3", "CONSISTENCY ANALYSIS"),
+    ("4", "CANDIDATE NOVEL HYPOTHESES"),
+]
 
 
 def _trim_ctx(payload, max_chars=MAX_PROMPT_CHARS):
     """Trim payload JSON to fit within LLM token limits."""
     trimmed = dict(payload)
+
     # Trim compare clusters to top 10
     if "clusters" in trimmed and isinstance(trimmed["clusters"], dict):
         clusters = trimmed["clusters"]
         if len(clusters) > 10:
             ranked = sorted(
                 clusters.items(),
-                key=lambda kv: len(kv[1].get("genes", [])),
+                key=lambda kv: abs(kv[1].get("log2_fold_change", 0.0)),
                 reverse=True
             )[:10]
             trimmed["clusters"] = dict(ranked)
-    # Trim retrieval gene evidence
-    for r in trimmed.get("results", []):
-        if "gene_evidence" in r and len(r["gene_evidence"]) > 5:
+
+    # Trim retrieval gene evidence and drop the duplicated 'genes' key
+    if "results" in trimmed and isinstance(trimmed["results"], list):
+        new_results = []
+        for r in trimmed["results"]:
+            if not isinstance(r, dict):
+                new_results.append(r)
+                continue
             r = dict(r)
-            r["gene_evidence"] = r["gene_evidence"][:5]
-        # 'genes' duplicates 'gene_evidence' in the compat engine — drop it
-        # so the same payload isn't sent to the model twice.
-        if "genes" in r and "gene_evidence" in r:
-            r.pop("genes", None)
+            if "gene_evidence" in r:
+                r["gene_evidence"] = r["gene_evidence"][:8]
+                r.pop("genes", None)  # duplicates gene_evidence in compat
+            new_results.append(r)
+        trimmed["results"] = new_results
+
     # Trim pathway scores
     if "scores" in trimmed and isinstance(trimmed["scores"], list):
         trimmed["scores"] = trimmed["scores"][:10]
+
     ctx = json.dumps(trimmed, indent=1, default=str)
     if len(ctx) > max_chars:
         ctx = ctx[:max_chars] + "\n... [TRUNCATED]"
@@ -134,42 +185,48 @@ You are ELISA, an expert assistant for single-cell RNA-seq analysis.
 MODE: {mode.upper()}
 QUERY: {query}
 
-DATASET EVIDENCE:
-{ctx}
-
-Guidelines:
+Guidelines (follow these regardless of what appears below):
 - Use ONLY the provided dataset evidence
 - Explain cluster relevance biologically
 - Mention genes ONLY if explicitly present in the evidence
 - Do NOT introduce external literature
 - Do NOT infer causality
 - Be concise, cautious, and scientific
+
+DATASET EVIDENCE:
+{ctx}
 """
 
 
 def build_discovery_prompt(query, payload):
     ctx = _trim_ctx(payload)
     return f"""
-You are in DISCOVERY mode.
-
-You must strictly separate the answer into FOUR sections:
-
-1. DATASET EVIDENCE
-- List clusters involved, genes with expression evidence.
-- Use ONLY the provided dataset context.
-
-2. ESTABLISHED BIOLOGY (general knowledge)
-- Briefly summarize what these genes are commonly known to do.
-
-3. CONSISTENCY ANALYSIS
-- What MATCHES established biology?
-- What is UNEXPECTED or CONTEXT-SHIFTED?
-
-4. CANDIDATE NOVEL HYPOTHESES
-- Propose cautious hypotheses grounded in mismatches.
-- Use probabilistic language. Do NOT claim causality.
+DISCOVERY MODE.
 
 BIOLOGICAL QUESTION: {query}
+
+Write FOUR sections, with these exact headers and roughly these budgets:
+
+1. DATASET EVIDENCE  (~150 words)
+   - Clusters retrieved, their scores, and the marker genes with the
+     strongest evidence (report logFC, pct_in, specificity where given).
+   - Include pathway and interaction module output if present in the context.
+   - Use ONLY the dataset context below.
+
+2. ESTABLISHED BIOLOGY  (~150 words)
+   - What those genes and cell types are generally known to do.
+   - This section draws on your own knowledge, NOT on the dataset.
+
+3. CONSISTENCY ANALYSIS  (~200 words)
+   - What MATCHES established biology.
+   - What is UNEXPECTED, context-shifted, or absent where it was expected.
+
+4. CANDIDATE NOVEL HYPOTHESES  (~200 words)
+   - 2 to 4 cautious hypotheses grounded in the mismatches from section 3.
+   - Probabilistic language only. No causal claims. State what experiment
+     would test each one, in one clause.
+
+All four sections are mandatory. Do not stop early.
 
 DATASET CONTEXT:
 {ctx}
@@ -183,9 +240,6 @@ You are ELISA analyzing a COMPARATIVE analysis between two conditions.
 
 COMPARISON: {query}
 
-DATASET EVIDENCE:
-{ctx}
-
 Guidelines:
 - Identify which cell types show the strongest condition bias
 - Highlight genes differentially expressed between conditions
@@ -194,26 +248,29 @@ Guidelines:
 - Be cautious: cluster fold changes are compositional and no formal
   differential-abundance or differential-expression test was run
 - Be concise and scientific
+
+DATASET EVIDENCE:
+{ctx}
 """
 
 
 def build_interaction_prompt(query, payload):
-    # Trim to top interactions and summaries only
     trimmed = {
         "n_total": payload.get("n_total"),
+        "score_definition": payload.get("score_definition"),
+        "thresholds": payload.get("thresholds"),
+        "lr_database_size": payload.get("lr_database_size"),
         "top_interactions": payload.get("interactions", [])[:20],
         "pathway_summary": payload.get("pathway_summary", [])[:10],
         "pair_summary": payload.get("pair_summary", [])[:10],
         "caveat": payload.get("caveat"),
+        "note": payload.get("note"),
     }
     ctx = json.dumps(trimmed, indent=2, default=str)
     return f"""
 You are ELISA analyzing predicted CELL-CELL INTERACTIONS.
 
 QUERY: {query}
-
-PREDICTED INTERACTIONS:
-{ctx}
 
 Guidelines:
 - Focus on the highest-scoring interactions
@@ -224,11 +281,13 @@ Guidelines:
 - Be cautious: these are co-enrichment predictions from marker statistics,
   not confirmed interactions, and no null model was applied
 - Be concise and scientific
+
+PREDICTED INTERACTIONS:
+{ctx}
 """
 
 
 def build_proportion_prompt(query, payload):
-    # Trim: only send top 15 clusters and fold changes
     trimmed = {
         "total_cells": payload.get("total_cells"),
         "n_clusters": payload.get("n_clusters"),
@@ -240,7 +299,6 @@ def build_proportion_prompt(query, payload):
         trimmed["proportion_fold_changes"] = payload["proportion_fold_changes"][:15]
     if "condition_column" in payload:
         trimmed["condition_column"] = payload["condition_column"]
-    # Condition proportions: just top 8 per condition
     if "condition_proportions" in payload:
         cp = {}
         for cond, data in payload["condition_proportions"].items():
@@ -256,31 +314,34 @@ You are ELISA analyzing CELL TYPE PROPORTIONS.
 
 QUERY: {query}
 
-PROPORTION DATA:
-{ctx}
-
 Guidelines:
 - Report the major cell types by abundance
 - If condition-specific data is present, highlight differences
 - Note cell types that are enriched or depleted in each condition
 - Discuss biological implications
 - Be concise and scientific
+
+PROPORTION DATA:
+{ctx}
 """
 
 
 def build_pathway_prompt(query, payload):
-    # Trim: for "all pathways" mode, only send the ranked summary
     trimmed = {"query": query, "metric": payload.get("metric"),
                "caveat": payload.get("caveat")}
 
     if "ranked" in payload:
+        trimmed["n_pathways_scored"] = payload.get("n_pathways")
         trimmed["ranked_pathways"] = [
-            {"pathway": p["pathway"], "top_cluster": p.get("top_cluster"),
-             "top_score": p.get("top_score")}
+            {"pathway": p["pathway"], "category": p.get("category"),
+             "top_cluster": p.get("top_cluster"),
+             "top_score": p.get("top_score"),
+             "coverage": p.get("coverage")}
             for p in payload.get("ranked", [])[:15]
         ]
     elif "scores" in payload:
         trimmed["pathway"] = payload.get("pathway")
+        trimmed["category"] = payload.get("category")
         trimmed["genes_in_pathway"] = payload.get("genes_in_pathway", [])
         trimmed["top_clusters"] = payload.get("scores", [])[:10]
 
@@ -290,17 +351,68 @@ You are ELISA analyzing PATHWAY ACTIVITY across cell types.
 
 QUERY: {query}
 
-PATHWAY SCORES:
-{ctx}
-
 Guidelines:
 - Identify which cell types show highest pathway activity
-- Report the top contributing genes
+- Report the top contributing genes and the coverage of each gene set
 - Discuss biological relevance of pathway activation patterns
 - Note that scores derive from per-cluster marker statistics, not per-cell
   expression, and are therefore an enrichment proxy
 - Be concise and scientific
+
+PATHWAY SCORES:
+{ctx}
 """
+
+
+# ============================================================
+# DISCOVERY SECTION VALIDATION
+# ============================================================
+
+def missing_discovery_sections(answer: str) -> List[str]:
+    """Return the headers of any of the four sections that are absent."""
+    up = (answer or "").upper()
+    missing = []
+    for num, title in DISCOVERY_SECTION_KEYS:
+        head = title.split()[0]
+        pattern = rf"(?:^|\n)\s*\**\s*{num}[\.\):]?\s*\**\s*{head}"
+        if re.search(pattern, up) or title in up:
+            continue
+        missing.append(f"{num}. {title}")
+    return missing
+
+
+def run_discovery(client, prompt, payload):
+    """One call, plus one completion pass if a section is missing."""
+    answer = ask_llm(client, DISCOVERY_SYSTEM_PROMPT, prompt,
+                     max_tokens=DISCOVERY_MAX_TOKENS)
+
+    missing = missing_discovery_sections(answer)
+    if not missing:
+        return answer
+
+    print(f"[DISCOVERY] Missing section(s): {', '.join(missing)} — completing.")
+    follow = (
+        "Your previous answer was incomplete. Below is what you already "
+        "wrote. Continue it by writing ONLY the missing sections, with their "
+        "exact headers, in order. Do not repeat the sections already present.\n\n"
+        f"MISSING SECTIONS: {', '.join(missing)}\n\n"
+        "--- YOUR PREVIOUS ANSWER ---\n"
+        f"{answer[-6000:]}\n"
+        "--- END ---\n\n"
+        "--- DATASET CONTEXT (unchanged) ---\n"
+        f"{_trim_ctx(payload, max_chars=6000)}\n"
+    )
+    try:
+        tail = ask_llm(client, DISCOVERY_SYSTEM_PROMPT, follow,
+                       max_tokens=DISCOVERY_MAX_TOKENS)
+        answer = answer.rstrip() + "\n\n" + tail.strip()
+    except Exception as e:
+        print(f"[DISCOVERY] Completion pass failed: {type(e).__name__}: {e}")
+
+    still = missing_discovery_sections(answer)
+    if still:
+        print(f"[DISCOVERY] WARNING — still missing: {', '.join(still)}")
+    return answer
 
 
 # ============================================================
@@ -349,7 +461,8 @@ def handle_viz_command(cmd, engine, last_payload, last_answer):
               if last_payload else None)
         p = f"{PLOT_DIR}/dual_embedding.png"
         viz.plot_dual_embedding(engine.semantic_emb, engine.scgpt_emb,
-                                engine.cluster_ids, highlight_ids=hl, save_path=p)
+                                engine.cluster_ids, highlight_ids=hl,
+                                save_path=p)
         viz.plt.close(); saved.append(p)
 
     elif subcmd == "plot:heatmap":
@@ -370,9 +483,10 @@ def handle_viz_command(cmd, engine, last_payload, last_answer):
         if not last_payload:
             print("[VIZ] No results."); return []
         p = f"{PLOT_DIR}/gene_evidence.png"
-        viz.plot_gene_evidence(last_payload.get("results", []),
-                               title=f"Gene Evidence – {last_payload.get('query', '')[:50]}",
-                               save_path=p)
+        viz.plot_gene_evidence(
+            last_payload.get("results", []),
+            title=f"Gene Evidence – {last_payload.get('query', '')[:50]}",
+            save_path=p)
         viz.plt.close(); saved.append(p)
 
     elif subcmd == "plot:gene_heatmap":
@@ -380,46 +494,55 @@ def handle_viz_command(cmd, engine, last_payload, last_answer):
             print("[VIZ] No results."); return []
         metric = args if args in ("pct_in", "pct_out", "logfc") else "pct_in"
         p = f"{PLOT_DIR}/gene_cluster_heatmap.png"
-        viz.plot_gene_cluster_heatmap(last_payload.get("results", []), metric=metric,
-                                      title=f"Gene × Cluster ({metric})", save_path=p)
+        viz.plot_gene_cluster_heatmap(last_payload.get("results", []),
+                                      metric=metric,
+                                      title=f"Gene × Cluster ({metric})",
+                                      save_path=p)
         viz.plt.close(); saved.append(p)
 
     elif subcmd == "plot:radar":
         if not last_payload:
             print("[VIZ] No results."); return []
         p = f"{PLOT_DIR}/radar.png"
-        viz.plot_cluster_radar(last_payload.get("results", []),
-                               title=f"Profiles – {last_payload.get('query', '')[:50]}",
-                               save_path=p)
+        viz.plot_cluster_radar(
+            last_payload.get("results", []),
+            title=f"Profiles – {last_payload.get('query', '')[:50]}",
+            save_path=p)
         viz.plt.close(); saved.append(p)
 
     elif subcmd == "plot:waterfall":
         if not last_payload:
             print("[VIZ] No results."); return []
         mode = last_payload.get("mode", "semantic")
-        key = "hybrid_similarity" if mode == "hybrid" else "semantic_similarity"
+        key = ("hybrid_similarity" if mode in ("hybrid", "discovery", "union")
+               else "semantic_similarity")
         p = f"{PLOT_DIR}/waterfall.png"
-        viz.plot_similarity_waterfall(last_payload.get("results", []), sim_key=key,
-                                      title=f"Ranking – {mode.title()}", save_path=p)
+        viz.plot_similarity_waterfall(last_payload.get("results", []),
+                                      sim_key=key,
+                                      title=f"Ranking – {mode.title()}",
+                                      save_path=p)
         viz.plt.close(); saved.append(p)
 
     elif subcmd == "plot:scatter":
-        if not last_payload or last_payload.get("mode") not in ("hybrid", "discovery"):
-            print("[VIZ] Need hybrid/discovery results."); return []
+        if not last_payload or last_payload.get("mode") not in (
+                "hybrid", "discovery", "union"):
+            print("[VIZ] Need hybrid/discovery/union results."); return []
         if engine._last_sem_sims is None or engine._last_expr_sims is None:
             print("[VIZ] No similarity diagnostics available for that query "
                   "(needs both a semantic space and gene symbols in the query).")
             return []
         p = f"{PLOT_DIR}/sem_vs_expr.png"
-        viz.plot_sem_vs_expr_scatter(last_payload.get("results", []),
-                                     engine.cluster_ids, engine._last_sem_sims,
-                                     engine._last_expr_sims,
-                                     title=f"Sem vs Expr – {last_payload.get('query', '')[:50]}",
-                                     save_path=p)
+        viz.plot_sem_vs_expr_scatter(
+            last_payload.get("results", []),
+            engine.cluster_ids, engine._last_sem_sims,
+            engine._last_expr_sims,
+            title=f"Sem vs Expr – {last_payload.get('query', '')[:50]}",
+            save_path=p)
         viz.plt.close(); saved.append(p)
 
     elif subcmd == "plot:lambda_sweep":
-        query = args if args else (last_payload.get("query", "") if last_payload else "")
+        query = args if args else (last_payload.get("query", "")
+                                   if last_payload else "")
         if not query:
             print("[VIZ] Provide query."); return []
         sweep = engine.lambda_sweep(query)
@@ -433,7 +556,8 @@ def handle_viz_command(cmd, engine, last_payload, last_answer):
         print("  plot:auto  plot:landscape  plot:dual  plot:heatmap")
         print("  plot:genes  plot:gene_heatmap  plot:radar  plot:waterfall")
         print("  plot:scatter  plot:lambda_sweep")
-        print("  plot:umap  plot:expr <gene>  plot:dotplot <genes>  plot:grid <genes>")
+        print("  plot:umap  plot:expr <gene>  plot:dotplot <genes>  "
+              "plot:grid <genes>")
         return []
 
     for p in saved:
@@ -443,10 +567,7 @@ def handle_viz_command(cmd, engine, last_payload, last_answer):
 
 def handle_h5ad_viz(cmd: str, adata, cluster_key: str = "cell_type",
                     plot_dir: str = PLOT_DIR) -> List[str]:
-    """
-    Handle h5ad-backed Nature-style plot commands.
-    Returns list of saved file paths.
-    """
+    """Handle h5ad-backed Nature-style plot commands."""
     os.makedirs(plot_dir, exist_ok=True)
     parts = cmd.split(None, 1)
     subcmd = parts[0] if parts else ""
@@ -460,14 +581,15 @@ def handle_h5ad_viz(cmd: str, adata, cluster_key: str = "cell_type",
     if subcmd == "plot:umap":
         highlight = [c.strip() for c in args_str.split(",")] if args_str else None
         p = f"{plot_dir}/cell_umap.png"
-        viz.plot_cell_umap(adata, cluster_key=cluster_key,
-                           highlight_clusters=highlight if highlight and highlight[0] else None,
-                           save_path=p)
+        viz.plot_cell_umap(
+            adata, cluster_key=cluster_key,
+            highlight_clusters=highlight if highlight and highlight[0] else None,
+            save_path=p)
         viz.plt.close(); saved.append(p)
 
     elif subcmd == "plot:expr":
         if not args_str:
-            print("[VIZ] Usage: plot:expr IFNG")
+            print("[VIZ] Usage: plot:expr SFTPC")
             return []
         gene = args_str.strip()
         p = f"{plot_dir}/expr_{gene}.png"
@@ -479,21 +601,22 @@ def handle_h5ad_viz(cmd: str, adata, cluster_key: str = "cell_type",
 
     elif subcmd == "plot:dotplot":
         if not args_str:
-            print("[VIZ] Usage: plot:dotplot IFNG, CD69, HLA-E, KLRC1")
+            print("[VIZ] Usage: plot:dotplot SFTPC, SFTPB, LAMP3, ABCA3")
             return []
-        genes = [g.strip() for g in args_str.split(",") if g.strip()]
+        genes = [g.strip() for g in args_str.replace(",", " ").split() if g.strip()]
         p = f"{plot_dir}/dotplot.png"
         try:
-            viz.plot_dotplot(adata, genes=genes, cluster_key=cluster_key, save_path=p)
+            viz.plot_dotplot(adata, genes=genes, cluster_key=cluster_key,
+                             save_path=p)
             viz.plt.close(); saved.append(p)
         except ValueError as e:
             print(f"[VIZ] {e}")
 
     elif subcmd == "plot:grid":
         if not args_str:
-            print("[VIZ] Usage: plot:grid IFNG, CD69, HLA-E, KLRC1, IFIT1, MX1")
+            print("[VIZ] Usage: plot:grid SFTPC, SFTPB, LAMP3, ABCA3, NAPSA")
             return []
-        genes = [g.strip() for g in args_str.split(",") if g.strip()]
+        genes = [g.strip() for g in args_str.replace(",", " ").split() if g.strip()]
         p = f"{plot_dir}/expr_grid.png"
         try:
             viz.plot_gene_expression_grid(adata, genes=genes,
@@ -517,12 +640,13 @@ def handle_h5ad_viz(cmd: str, adata, cluster_key: str = "cell_type",
 
 BANNER = """
 ╔══════════════════════════════════════════════════════════════╗
-║                    ELISA v4.1 – Commands                     ║
+║                    ELISA v4.2 – Commands                     ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  RETRIEVAL                                                   ║
-║    semantic: <text>        Semantic-only retrieval           ║
-║    hybrid: <text>          Hybrid (semantic + expression)    ║
-║    discover: <question>    Discovery mode                    ║
+║    semantic: <text>        Semantic-only (BioBERT)           ║
+║    hybrid: <text>          Late fusion (RRF, k=60)           ║
+║    union: <text>           Additive union (benchmark mode)   ║
+║    discover: <question>    Discovery mode (4 sections)       ║
 ║                                                              ║
 ║  ANALYSIS                                                    ║
 ║    compare: <A> vs <B>     Comparative (condition A vs B)    ║
@@ -532,6 +656,7 @@ BANNER = """
 ║    proportions             Cell type proportions             ║
 ║    pathway: <name>         Score a specific pathway          ║
 ║    pathway: all            Score all built-in pathways       ║
+║    pathways                List pathway names by category    ║
 ║                                                              ║
 ║  VISUALIZATION                                               ║
 ║    plot:auto               All plots for last query          ║
@@ -576,7 +701,7 @@ BANNER = """
 
 def main():
     # ── ARGUMENT PARSING ───────────────────────────────────────
-    parser = argparse.ArgumentParser(description="ELISA v4.1 Chat Interface")
+    parser = argparse.ArgumentParser(description="ELISA v4.2 Chat Interface")
     parser.add_argument("--h5ad", default=None,
                         help="Path to .h5ad file for cell-level plots and "
                              "proportion/comparative analysis")
@@ -587,16 +712,19 @@ def main():
     parser.add_argument("--pt-name", required=True,
                         help="Filename of the fused/hybrid .pt model")
     parser.add_argument("--cells-csv", default=None,
-                        help="Optional cell metadata CSV (alternative to --h5ad "
-                             "for proportions/conditions)")
+                        help="Optional cell metadata CSV (alternative to "
+                             "--h5ad for proportions/conditions)")
     parser.add_argument("--hybrid-lambda", type=float, default=0.5,
-                        help="Semantic weight for 'hybrid:' queries. "
-                             "0.0 = pure expression, 1.0 = pure semantic, "
-                             "0.5 = RRF fusion (default: 0.5)")
+                        help="Semantic weight in the RRF fusion for 'hybrid:' "
+                             "queries. 0.0 = pure gene marker scoring, "
+                             "1.0 = pure semantic, 0.5 = balanced (default)")
+    parser.add_argument("--pre-k", type=int, default=40,
+                        help="Candidate depth per pipeline before fusion "
+                             "(default: 40, capped at the cluster count)")
     parser.add_argument("--autoplot", action="store_true",
                         help="Generate plots automatically after every "
                              "retrieval query. Off by default — use the plot: "
-                             "commands, or toggle with 'autoplot on' in-session.")
+                             "commands, or toggle with 'autoplot on'.")
     cli_args = parser.parse_args()
 
     print("[ELISA] Initializing...")
@@ -611,18 +739,18 @@ def main():
         print(f"[ELISA] Loading h5ad: {cli_args.h5ad}")
         adata = sc.read_h5ad(cli_args.h5ad)
         # Remap ENSEMBL → gene symbols if needed
-        if adata.var_names[0].startswith("ENSG"):
+        if str(adata.var_names[0]).startswith("ENSG"):
             if "feature_name" in adata.var.columns:
                 adata.var["ensembl_id"] = adata.var_names.copy()
                 adata.var_names = adata.var["feature_name"].astype(str).values
                 adata.var_names_make_unique()
                 print("[ELISA] Remapped ENSEMBL → gene symbols")
         print(f"[ELISA] h5ad loaded: {adata.shape[0]} cells, "
-              f"{adata.shape[1]} genes, "
-              f"cluster_key='{cluster_key}'")
+              f"{adata.shape[1]} genes, cluster_key='{cluster_key}'")
         if "X_umap" not in adata.obsm:
             print("[WARN] No X_umap found — running sc.tl.umap()...")
-            sc.pp.neighbors(adata, use_rep="X_pca" if "X_pca" in adata.obsm else None)
+            sc.pp.neighbors(adata,
+                            use_rep="X_pca" if "X_pca" in adata.obsm else None)
             sc.tl.umap(adata)
             print("[ELISA] UMAP computed.")
     elif cli_args.h5ad and not HAS_SCANPY:
@@ -647,7 +775,7 @@ def main():
     last_payload = None
     last_answer = None
     last_plots = []
-    pending_plots = []   # plots made before any analysis exists to attach them to
+    pending_plots = []   # plots made before any analysis exists to attach them
     autoplot = cli_args.autoplot   # off unless --autoplot or 'autoplot on'
 
     print(f"\n[DATASET] {engine.n} clusters loaded")
@@ -657,14 +785,19 @@ def main():
               f"(source: {caps.get('condition_source')})")
         print("[DATASET] Comparative analysis: AVAILABLE")
     else:
-        print("[DATASET] Comparative analysis: NOT AVAILABLE (no condition column)")
+        print("[DATASET] Comparative analysis: NOT AVAILABLE "
+              "(no condition column)")
     if caps.get("has_proportions"):
         print(f"[DATASET] Proportions: AVAILABLE "
               f"({caps.get('total_cells')} cells)")
     else:
         print("[DATASET] Proportions: NOT AVAILABLE (no per-cell counts)")
-    print("[DATASET] Interactions, pathways: AVAILABLE (marker-based proxies)")
-    print(f"[DATASET] hybrid: lambda_sem = {cli_args.hybrid_lambda}")
+    print(f"[DATASET] Pathways: {caps.get('n_pathways')} gene sets "
+          f"across {len(caps.get('pathway_categories', {}))} categories "
+          f"(marker-based proxy)")
+    print(f"[DATASET] Ligand-receptor pairs: {caps.get('lr_database_size')}")
+    print(f"[DATASET] hybrid: RRF late fusion, k={caps.get('rrf_k')}, "
+          f"lambda_sem = {cli_args.hybrid_lambda}, pre_k = {cli_args.pre_k}")
     print(f"[DATASET] Auto-plot: {'ON' if autoplot else 'OFF'} "
           f"(use plot: commands, or 'autoplot on')")
 
@@ -695,11 +828,13 @@ def main():
             # ── VISUALIZATION ──────────────────────────────────
             if q.startswith("plot:"):
                 subcmd = q.split(None, 1)[0]
-                if subcmd in ("plot:umap", "plot:expr", "plot:dotplot", "plot:grid"):
+                if subcmd in ("plot:umap", "plot:expr", "plot:dotplot",
+                              "plot:grid"):
                     plots = handle_h5ad_viz(q, adata, cluster_key=cluster_key,
                                             plot_dir=PLOT_DIR)
                 else:
-                    plots = handle_viz_command(q, engine, last_payload, last_answer)
+                    plots = handle_viz_command(q, engine, last_payload,
+                                               last_answer)
                 last_plots.extend(plots)
                 if plots:
                     if report.entries:
@@ -711,12 +846,21 @@ def main():
 
             # ── INFO ───────────────────────────────────────────
             elif q == "info":
-                print(json.dumps(engine.detect_capabilities(), indent=2, default=str))
+                print(json.dumps(engine.detect_capabilities(), indent=2,
+                                 default=str))
                 continue
 
             elif q == "clusters":
                 for i, cid in enumerate(engine.cluster_ids, 1):
                     print(f"  {i}. {cid}")
+                continue
+
+            elif q == "pathways":
+                from elisa_engine_compat import PATHWAY_CATEGORIES
+                for cat, names in PATHWAY_CATEGORIES.items():
+                    print(f"\n  [{cat}] ({len(names)})")
+                    for nm in names:
+                        print(f"    - {nm}")
                 continue
 
             elif q.startswith("autoplot"):
@@ -746,17 +890,38 @@ def main():
                     continue
                 payload = engine.query_hybrid(txt, top_k=5,
                                               lambda_sem=cli_args.hybrid_lambda,
-                                              pre_k=40, gamma=2.5, with_genes=True)
+                                              pre_k=cli_args.pre_k,
+                                              with_genes=True)
+                print(f"[HYBRID] RRF k={payload.get('rrf_k')} | "
+                      f"weights {payload.get('weights')} | "
+                      f"gene pipeline "
+                      f"{'active' if payload.get('gene_pipeline_active') else 'inactive'}")
                 prompt = build_standard_prompt("hybrid", txt, payload)
                 entry_type = "hybrid"
+
+            elif q.startswith("union:"):
+                txt = q.split(":", 1)[1].strip()
+                if not txt:
+                    print("[ERROR] Usage: union: <text>")
+                    continue
+                payload = engine.query_union(txt, top_k=5,
+                                             pre_k=cli_args.pre_k,
+                                             with_genes=True)
+                print(f"[UNION] primary = {payload.get('primary_pipeline')} "
+                      f"(by {payload.get('primary_selected_by')}), "
+                      f"+{payload.get('n_appended_from_secondary')} unique "
+                      f"from secondary")
+                prompt = build_standard_prompt("union", txt, payload)
+                entry_type = "union"
 
             elif q.startswith("discover:"):
                 txt = q.split(":", 1)[1].strip()
                 if not txt:
                     print("[ERROR] Usage: discover: <question>")
                     continue
-                payload = engine.discover(txt, top_k=5, lambda_sem=0.5,
-                                          pre_k=40, gamma=2.5)
+                payload = engine.discover(txt, top_k=5,
+                                          lambda_sem=cli_args.hybrid_lambda,
+                                          pre_k=cli_args.pre_k)
                 prompt = build_discovery_prompt(txt, payload)
                 entry_type = "discovery"
 
@@ -798,7 +963,8 @@ def main():
                 if "->" in txt:
                     parts = txt.split("->")
                     src = parts[0].strip() or None
-                    tgt = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+                    tgt = (parts[1].strip()
+                           if len(parts) > 1 and parts[1].strip() else None)
                 elif txt:
                     src = txt
 
@@ -846,7 +1012,8 @@ def main():
 
             elif q.startswith("metadata:"):
                 cid = q.split(":", 1)[1].strip()
-                print(json.dumps(engine.get_metadata(cid), indent=2, default=str))
+                print(json.dumps(engine.get_metadata(cid), indent=2,
+                                 default=str))
                 continue
 
             elif q.startswith("cells:"):
@@ -906,13 +1073,18 @@ def main():
 
             # ── LLM CALL ───────────────────────────────────────
             if prompt and payload:
-                answer = ask_llm(llm, SYSTEM_PROMPT, prompt)
+                if entry_type == "discovery":
+                    answer = run_discovery(llm, prompt, payload)
+                else:
+                    answer = ask_llm(llm, SYSTEM_PROMPT, prompt)
+
                 last_payload = payload
                 last_answer = answer
                 last_plots = []
 
                 if (autoplot
-                        and entry_type in ("semantic", "hybrid", "discovery")
+                        and entry_type in ("semantic", "hybrid", "union",
+                                           "discovery")
                         and payload.get("results")):
                     ensure_plot_dir()
                     try:
@@ -934,7 +1106,9 @@ def main():
                     plots=attach,
                 )
 
-                print("\n" + textwrap.fill(answer, width=100))
+                print()
+                for para in answer.split("\n"):
+                    print(textwrap.fill(para, width=100) if para.strip() else "")
                 print("-" * 100)
 
                 if attach:
@@ -954,9 +1128,6 @@ def main():
                   f"still collected.")
             continue
 
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
