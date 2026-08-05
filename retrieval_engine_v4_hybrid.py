@@ -4,37 +4,54 @@
 elisa_engine_compat.py
 ======================
 Compatibility layer between `retrieval_engine_v4_hybrid.RetrievalEngine`
-(a thin v3-benchmark shim) and `elisa_chat_v4.py`, which expects a much
-larger engine surface.
+(a thin v3-benchmark shim) and `elisa_chat_v4.py`.
 
-Usage — change ONE line in elisa_chat_v4.py:
+Usage — in elisa_chat_v4.py:
 
-    # from retrieval_engine_v4_hybrid import RetrievalEngine
     from elisa_engine_compat import RetrievalEngine
 
-Optionally, right after the h5ad is loaded in main(), add:
+and, right after the h5ad is loaded:
 
     if adata is not None:
         engine.attach_adata(adata, cluster_key=cluster_key)
 
-That unlocks proportions/compare using real per-cell metadata instead of
-whatever happens to be in metadata_per_cluster.
 
-IMPORTANT CAVEATS
------------------
+ALIGNMENT WITH THE MANUSCRIPT
+-----------------------------
+This version implements the algorithms exactly as described in the paper,
+so that code and text agree:
+
+* Hybrid retrieval is TRUE LATE FUSION via reciprocal rank fusion
+  (Eq. 8, k = 60, per-pipeline weights). `lambda_sem` is the semantic
+  weight: 0.0 = pure gene marker scoring, 1.0 = pure semantic,
+  0.5 = balanced 1:1 fusion. `pre_k` controls the candidate depth of
+  each pipeline before fusion and is genuinely used.
+* `query_union()` implements the additive union benchmarking strategy
+  (primary pipeline's full ranked list, then unique clusters from the
+  secondary appended in original rank order).
+* Ligand-receptor score = pct_in(ligand, source) * pct_in(receptor, target),
+  with min ligand 0.10, min receptor 0.05, self-interactions excluded.
+* Pathway score = mean pct_in over pathway genes detected in the cluster's
+  DE profile, requiring >= 3 detected genes for a non-zero score, with
+  coverage reported alongside.
+* Gene evidence is ranked by |log2FC| x specificity x detection over
+  ENRICHED genes only (pct_in >= 0.10, padj <= 0.05), which suppresses the
+  junk (TCR segments, lincRNAs, olfactory receptors, unmapped ENSG) that
+  plain |log2FC| sorting surfaces.
+
+REMAINING CAVEATS (stated honestly in the payloads)
+---------------------------------------------------
 * `gene_stats` holds per-cluster DE/marker statistics, not a full expression
-  matrix. Anything derived from it (pathway scores, interactions) is a
-  *marker-enrichment proxy*, not a measurement. Treated as such throughout.
-* `interactions()` uses a small built-in ligand-receptor table. It predicts
-  co-enrichment of a ligand in one cluster and its receptor in another.
-  It is not CellPhoneDB / CellChat and makes no permutation-based claims.
+  matrix. Pathway scores and interactions are therefore *marker-enrichment
+  proxies*, not per-cell measurements.
+* `interactions()` predicts co-enrichment of a ligand in one cluster and its
+  receptor in another. No null model / permutation test is applied.
 * `compare()` requires per-cell condition labels (attached h5ad or cells_csv).
   Without them it returns {"error": ...} rather than fabricating a result.
 """
 
-import os
 import math
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional
 
 import numpy as np
 
@@ -43,7 +60,7 @@ from retrieval_engine_v4_hybrid import (
     classify_query,
     extract_gene_names,
     gene_pipeline,
-    semantic_pipeline,
+    semantic_pipeline,  # noqa: F401  (kept for API parity with the v3 module)
 )
 
 
@@ -71,65 +88,131 @@ def _f(v, default=0.0) -> float:
 
 CONDITION_KEY_CANDIDATES = [
     "condition", "disease", "disease_state", "disease__ontology_label",
-    "status", "group", "treatment", "genotype", "phenotype", "diagnosis",
-    "sample_type", "stimulation", "timepoint", "age_group", "development_stage",
+    "status", "group", "patient_group", "treatment", "genotype", "phenotype",
+    "diagnosis", "sample_type", "stimulation", "timepoint", "age_group",
+    "development_stage", "organoid_line", "line",
 ]
 
 # Columns that look like conditions but are really identifiers
 CONDITION_KEY_BLOCKLIST = {
     "donor_id", "sample_id", "cell_id", "barcode", "batch", "library_id",
+    "suspension_type", "assay",
 }
+
+# Reciprocal rank fusion constant (manuscript Eq. 8)
+RRF_K = 60
 
 
 # ============================================================
 # BUILT-IN PATHWAY GENE SETS
+# 60+ curated sets across the five categories named in the manuscript.
 # ============================================================
 
 PATHWAYS: Dict[str, List[str]] = {
+
+    # ---------- IMMUNE SIGNALING ----------
     "type_i_interferon": [
         "IFIT1", "IFIT2", "IFIT3", "ISG15", "MX1", "MX2", "OAS1", "OAS2",
         "OAS3", "IFI6", "IFI27", "IFI44L", "STAT1", "STAT2", "IRF7", "IRF9",
-        "RSAD2", "BST2", "XAF1",
+        "RSAD2", "BST2", "XAF1", "IFITM3",
+    ],
+    "interferon_gamma": [
+        "IFNG", "IFNGR1", "IFNGR2", "STAT1", "IRF1", "JAK1", "JAK2", "GBP1",
+        "GBP2", "GBP5", "CXCL9", "CXCL10", "CXCL11", "SOCS1", "CIITA",
+    ],
+    "tnf_nfkb": [
+        "TNF", "TNFAIP3", "NFKB1", "NFKB2", "RELA", "RELB", "NFKBIA",
+        "NFKBIZ", "TRAF1", "BIRC3", "CXCL2", "CCL20", "ICAM1", "SOD2",
+    ],
+    "jak_stat": [
+        "JAK1", "JAK2", "JAK3", "TYK2", "STAT1", "STAT2", "STAT3", "STAT4",
+        "STAT5A", "STAT5B", "STAT6", "SOCS1", "SOCS3", "PIAS1",
+    ],
+    "complement": [
+        "C1QA", "C1QB", "C1QC", "C1R", "C1S", "C2", "C3", "C3AR1", "C5AR1",
+        "CFB", "CFD", "CFH", "CD55", "CD59", "SERPING1",
+    ],
+    "tlr_signaling": [
+        "TLR1", "TLR2", "TLR3", "TLR4", "TLR5", "TLR7", "TLR8", "TLR9",
+        "MYD88", "TICAM1", "IRAK1", "IRAK4", "TRAF6", "CD14", "LY96",
+    ],
+    "chemokine_signaling": [
+        "CXCL1", "CXCL2", "CXCL8", "CXCL9", "CXCL10", "CXCL12", "CCL2",
+        "CCL3", "CCL4", "CCL5", "CCL19", "CCL21", "CXCR3", "CXCR4", "CCR7",
+    ],
+    "inflammatory_cytokines": [
+        "IL1A", "IL1B", "IL6", "TNF", "CXCL8", "CCL2", "CCL3", "CCL4",
+        "CXCL1", "CXCL2", "PTGS2", "SOD2", "NFKB1", "NFKBIA",
     ],
     "antigen_presentation_mhc_i": [
         "HLA-A", "HLA-B", "HLA-C", "HLA-E", "HLA-F", "B2M", "TAP1", "TAP2",
-        "TAPBP", "PSMB8", "PSMB9", "NLRC5", "CALR",
+        "TAPBP", "PSMB8", "PSMB9", "NLRC5", "CALR", "CANX",
     ],
     "antigen_presentation_mhc_ii": [
         "HLA-DRA", "HLA-DRB1", "HLA-DPA1", "HLA-DPB1", "HLA-DQA1", "HLA-DQB1",
-        "HLA-DMA", "HLA-DMB", "CD74", "CIITA",
+        "HLA-DMA", "HLA-DMB", "HLA-DOA", "CD74", "CIITA",
     ],
     "cytotoxicity": [
         "GZMA", "GZMB", "GZMH", "GZMK", "PRF1", "GNLY", "NKG7", "KLRD1",
-        "KLRK1", "FASLG", "IFNG", "CTSW",
+        "KLRK1", "KLRC1", "FASLG", "IFNG", "CTSW",
     ],
-    "inflammatory_cytokines": [
-        "IL1B", "IL6", "TNF", "CXCL8", "CCL2", "CCL3", "CCL4", "CXCL1",
-        "CXCL2", "CXCL10", "NFKB1", "NFKBIA", "PTGS2", "SOD2",
+    "t_cell_activation": [
+        "CD3D", "CD3E", "CD3G", "CD247", "LCK", "ZAP70", "LAT", "CD28",
+        "ICOS", "TNFRSF9", "CD69", "IL2RA", "NFATC1", "ITK",
     ],
-    "hypoxia": [
-        "HIF1A", "VEGFA", "SLC2A1", "LDHA", "PGK1", "ALDOA", "ENO1", "CA9",
-        "ADM", "BNIP3", "NDRG1", "P4HA1",
+    "t_cell_exhaustion": [
+        "PDCD1", "LAG3", "HAVCR2", "TIGIT", "CTLA4", "TOX", "TOX2", "ENTPD1",
+        "BTLA", "CD244", "EOMES", "NR4A1",
     ],
-    "angiogenesis_vegf": [
-        "VEGFA", "VEGFB", "VEGFC", "KDR", "FLT1", "FLT4", "PGF", "NRP1",
-        "NRP2", "ANGPT1", "ANGPT2", "TEK", "PECAM1", "CDH5", "ESM1",
+    "b_cell_receptor": [
+        "CD19", "MS4A1", "CD79A", "CD79B", "BLNK", "BTK", "SYK", "PAX5",
+        "BANK1", "CR2", "FCRL1", "TNFRSF13C",
     ],
-    "epithelial_mesenchymal_transition": [
-        "VIM", "FN1", "CDH2", "SNAI1", "SNAI2", "TWIST1", "ZEB1", "ZEB2",
-        "SPARC", "TAGLN", "ACTA2", "COL1A1", "COL1A2", "TGFB1",
+    "inflammasome": [
+        "NLRP3", "PYCARD", "CASP1", "IL1B", "IL18", "GSDMD", "TXNIP",
+        "NLRC4", "AIM2", "NEK7", "P2RX7",
     ],
+    "immune_checkpoint": [
+        "CD274", "PDCD1LG2", "PDCD1", "CTLA4", "CD80", "CD86", "LGALS9",
+        "HAVCR2", "TIGIT", "NECTIN2", "PVR", "CD47", "SIRPA", "HLA-E",
+    ],
+
+    # ---------- CELL BIOLOGY ----------
     "cell_cycle": [
         "MKI67", "TOP2A", "CCNB1", "CCNA2", "CDK1", "PCNA", "TYMS", "BIRC5",
-        "AURKB", "UBE2C", "RRM2", "TUBB4B", "STMN1", "HMGB2",
+        "AURKB", "UBE2C", "RRM2", "TUBB4B", "STMN1", "HMGB2", "ASPM", "KIF11",
+    ],
+    "dna_replication": [
+        "MCM2", "MCM3", "MCM4", "MCM5", "MCM6", "MCM7", "PCNA", "RFC2",
+        "RFC4", "POLA1", "POLE", "PRIM1", "GINS2", "CDC45",
+    ],
+    "dna_damage_response": [
+        "ATM", "ATR", "CHEK1", "CHEK2", "TP53", "TP53BP1", "H2AX", "BRCA1",
+        "BRCA2", "RAD50", "RAD51", "MRE11", "ERCC6", "ERCC8", "XRCC1",
     ],
     "apoptosis": [
         "BAX", "BAK1", "BID", "CASP3", "CASP7", "CASP8", "CASP9", "BCL2",
-        "BCL2L1", "MCL1", "TP53", "CDKN1A", "PMAIP1", "BBC3",
+        "BCL2L1", "MCL1", "TP53", "CDKN1A", "PMAIP1", "BBC3", "APAF1",
     ],
-    "oxidative_phosphorylation": [
-        "NDUFA4", "NDUFB2", "COX4I1", "COX5A", "COX6C", "COX7C", "ATP5F1A",
-        "ATP5F1B", "ATP5MC2", "UQCRB", "UQCRQ", "SDHB", "CYC1",
+    "autophagy": [
+        "MAP1LC3B", "GABARAP", "GABARAPL1", "SQSTM1", "ATG3", "ATG5", "ATG7",
+        "ATG12", "ATG16L1", "BECN1", "ULK1", "WIPI2", "LAMP1", "TFEB",
+    ],
+    "senescence": [
+        "CDKN1A", "CDKN2A", "TP53", "SERPINE1", "GLB1", "IL6", "CXCL8",
+        "IGFBP3", "IGFBP7", "MMP3", "TNFRSF10C", "LMNB1",
+    ],
+    "mtor_signaling": [
+        "MTOR", "RPTOR", "RICTOR", "AKT1", "RPS6", "RPS6KB1", "EIF4EBP1",
+        "TSC1", "TSC2", "RHEB", "DDIT4", "LAMTOR1", "SLC7A5",
+    ],
+    "pi3k_akt": [
+        "PIK3CA", "PIK3CB", "PIK3R1", "AKT1", "AKT2", "PTEN", "PDK1",
+        "GSK3B", "FOXO1", "FOXO3", "INPP4B", "MTOR", "BAD",
+    ],
+    "mapk_erk": [
+        "MAPK1", "MAPK3", "MAP2K1", "MAP2K2", "RAF1", "BRAF", "KRAS", "HRAS",
+        "NRAS", "DUSP1", "DUSP6", "SOS1", "SHC1", "GRB2",
     ],
     "wnt_signaling": [
         "WNT2", "WNT2B", "WNT5A", "WNT7B", "WNT11", "FZD1", "FZD2", "FZD4",
@@ -137,15 +220,123 @@ PATHWAYS: Dict[str, List[str]] = {
     ],
     "notch_signaling": [
         "NOTCH1", "NOTCH2", "NOTCH3", "NOTCH4", "JAG1", "JAG2", "DLL1",
-        "DLL3", "DLL4", "HES1", "HEY1", "HEYL", "RBPJ",
+        "DLL3", "DLL4", "HES1", "HEY1", "HEYL", "RBPJ", "MAML1",
+    ],
+    "hippo_yap": [
+        "YAP1", "WWTR1", "TEAD1", "TEAD2", "TEAD4", "LATS1", "LATS2", "STK3",
+        "STK4", "SAV1", "MOB1A", "AMOTL2", "CTGF", "CYR61", "ANKRD1",
+    ],
+    "hedgehog_signaling": [
+        "SHH", "IHH", "DHH", "PTCH1", "PTCH2", "SMO", "GLI1", "GLI2", "GLI3",
+        "SUFU", "HHIP", "GAS1",
     ],
     "tgf_beta_bmp": [
         "TGFB1", "TGFB2", "TGFB3", "TGFBR1", "TGFBR2", "SMAD2", "SMAD3",
         "SMAD4", "BMP2", "BMP4", "BMPR1A", "BMPR2", "ID1", "ID2", "ID3",
     ],
+    "ubiquitin_proteasome": [
+        "UBB", "UBC", "UBA1", "UBE2D3", "UBE2N", "UBE2I", "UBA2", "ITCH",
+        "NEDD4", "NEDD4L", "TRIM21", "TRIM65", "PIAS1", "PSMA1", "PSMB5",
+        "USP8", "UBAP1",
+    ],
+    "unfolded_protein_response": [
+        "HSPA5", "DDIT3", "XBP1", "ATF4", "ATF6", "ERN1", "EIF2AK3", "PDIA3",
+        "PDIA4", "HERPUD1", "SEL1L", "EDEM1", "CALR", "CANX",
+    ],
+    "epithelial_mesenchymal_transition": [
+        "VIM", "FN1", "CDH2", "SNAI1", "SNAI2", "TWIST1", "ZEB1", "ZEB2",
+        "SPARC", "TAGLN", "ACTA2", "COL1A1", "COL1A2", "TGFB1", "SERPINE1",
+    ],
+    "hypoxia": [
+        "HIF1A", "VEGFA", "SLC2A1", "LDHA", "PGK1", "ALDOA", "ENO1", "CA9",
+        "ADM", "BNIP3", "NDRG1", "P4HA1", "EGLN3",
+    ],
+
+    # ---------- NEUROSCIENCE ----------
+    "glutamatergic_synapse": [
+        "SLC17A6", "SLC17A7", "GRIN1", "GRIN2B", "GRIA1", "GRIA2", "GRM5",
+        "DLG4", "SHANK2", "SHANK3", "CAMK2A", "SYN1", "NEFM",
+    ],
+    "gabaergic_synapse": [
+        "GAD1", "GAD2", "SLC32A1", "GABRA1", "GABRB2", "GABRG2", "GPHN",
+        "DLX1", "DLX2", "DLX5", "LHX6", "SST", "PVALB", "VIP",
+    ],
+    "synaptic_vesicle_cycle": [
+        "SNAP25", "SYT1", "STX1A", "VAMP2", "SYP", "SV2A", "RAB3A", "CPLX1",
+        "NSF", "UNC13A", "SYN2", "DNM1",
+    ],
+    "neurogenesis": [
+        "SOX2", "PAX6", "NES", "VIM", "HES1", "HES5", "FABP7", "DCX",
+        "NEUROD1", "NEUROG2", "ASCL1", "TBR1", "EOMES", "RBFOX3",
+    ],
+    "myelination": [
+        "MBP", "MOG", "PLP1", "MAG", "MPZ", "CNP", "SOX10", "OLIG1", "OLIG2",
+        "PDGFRA", "CSPG4", "CDH19",
+    ],
+    "axon_guidance": [
+        "ROBO1", "ROBO2", "SLIT1", "SLIT2", "DCC", "NTN1", "UNC5B", "EPHA4",
+        "EPHB2", "EFNB2", "SEMA3A", "PLXNA2", "NRP1", "NRP2",
+    ],
+    "dopaminergic_neuron": [
+        "TH", "DDC", "SLC6A3", "SLC18A2", "NR4A2", "LMX1A", "LMX1B", "FOXA2",
+        "PITX3", "EN1", "KCNJ6", "CALB1",
+    ],
+    "neurodegeneration": [
+        "APP", "APOE", "MAPT", "PSEN1", "SNCA", "TREM2", "GRN", "SORT1",
+        "CLU", "BIN1", "PICALM", "TARDBP",
+    ],
+
+    # ---------- METABOLISM ----------
+    "oxidative_phosphorylation": [
+        "NDUFA4", "NDUFB2", "NDUFS1", "COX4I1", "COX5A", "COX6C", "COX7C",
+        "ATP5F1A", "ATP5F1B", "ATP5MC2", "UQCRB", "UQCRQ", "SDHB", "CYC1",
+    ],
+    "glycolysis": [
+        "HK1", "HK2", "GPI", "PFKL", "PFKP", "ALDOA", "GAPDH", "PGK1",
+        "PGAM1", "ENO1", "PKM", "LDHA", "SLC2A1", "SLC16A3",
+    ],
+    "fatty_acid_oxidation": [
+        "CPT1A", "CPT2", "ACADM", "ACADVL", "HADHA", "HADHB", "ACAA2",
+        "ECHS1", "ACOX1", "PPARA", "SLC25A20", "ETFA",
+    ],
+    "lipid_metabolism": [
+        "FASN", "SCD", "ACACA", "ACLY", "ELOVL5", "ELOVL6", "DGAT1", "DGAT2",
+        "PLIN1", "PLIN2", "FABP4", "FABP5", "LPL", "APOE", "SOAT1",
+    ],
+    "cholesterol_biosynthesis": [
+        "HMGCR", "HMGCS1", "SQLE", "LSS", "FDFT1", "IDI1", "MVD", "MVK",
+        "DHCR7", "DHCR24", "SREBF2", "INSIG1", "LDLR",
+    ],
+    "amino_acid_metabolism": [
+        "GLS", "GLUL", "ASNS", "PSAT1", "PHGDH", "SHMT2", "SLC7A11",
+        "SLC7A5", "SLC1A5", "GOT1", "GOT2", "BCAT1",
+    ],
+    "one_carbon_metabolism": [
+        "MTHFD1", "MTHFD2", "SHMT1", "SHMT2", "TYMS", "DHFR", "MTR", "MTRR",
+        "ATIC", "GART", "FOLR1", "SLC19A1",
+    ],
+    "ros_oxidative_stress": [
+        "SOD1", "SOD2", "CAT", "GPX1", "GPX4", "PRDX1", "PRDX2", "TXN",
+        "TXNRD1", "NQO1", "HMOX1", "GCLC", "GCLM", "NFE2L2", "TXNIP",
+    ],
+    "heme_iron_metabolism": [
+        "HMOX1", "FTL", "FTH1", "TFRC", "SLC40A1", "SLC11A2", "ALAS1",
+        "ALAS2", "HBB", "HBA1", "CP", "HAMP",
+    ],
+
+    # ---------- TISSUE-SPECIFIC ----------
     "alveolar_surfactant": [
-        "SFTPC", "SFTPB", "SFTPA1", "SFTPA2", "SFTPD", "NAPSA", "LAMP3",
-        "PGC", "SLC34A2", "ABCA3", "NKX2-1", "AGER", "PDPN", "HOPX",
+        "SFTPC", "SFTPB", "SFTPA1", "SFTPA2", "SFTPD", "SFTA3", "NAPSA",
+        "LAMP3", "PGC", "SLC34A2", "ABCA3", "NKX2-1", "LPCAT1", "CTSH",
+    ],
+    "surfactant_processing_trafficking": [
+        "ITCH", "NEDD4", "NEDD4L", "UBE2N", "HGS", "VPS28", "UBAP1", "USP8",
+        "RABGEF1", "EEA1", "MICALL1", "LAMP3", "ABCA3", "CTSH", "CKAP4",
+        "ZDHHC2",
+    ],
+    "alveolar_type_1": [
+        "AGER", "PDPN", "CAV1", "AQP5", "HOPX", "CLIC5", "SPOCK2", "EMP2",
+        "RTKN2", "MYL9", "TIMP3",
     ],
     "ciliogenesis": [
         "FOXJ1", "DNAH5", "DNAI1", "DNAI2", "RSPH1", "RSPH4A", "PIFO",
@@ -155,54 +346,392 @@ PATHWAYS: Dict[str, List[str]] = {
         "MUC5AC", "MUC5B", "MUC1", "MUC16", "SCGB1A1", "SCGB3A1", "SCGB3A2",
         "BPIFA1", "BPIFB1", "TFF3", "AGR2", "SPDEF", "CREB3L1",
     ],
+    "epithelial_defense": [
+        "LTF", "LYZ", "SLPI", "PIGR", "DEFB1", "S100A8", "S100A9", "CXCL17",
+        "BPIFA1", "SCGB1A1", "WFDC2", "MUC1",
+    ],
     "extracellular_matrix": [
         "COL1A1", "COL1A2", "COL3A1", "COL4A1", "COL6A2", "FN1", "LUM",
         "DCN", "ELN", "FBN1", "MMP2", "MMP9", "TIMP1", "SPARC", "POSTN",
     ],
+    "fibrosis": [
+        "COL1A1", "COL3A1", "ACTA2", "TAGLN", "POSTN", "FAP", "TGFB1",
+        "SERPINE1", "CTGF", "LOX", "LOXL2", "PDGFRB", "THBS2",
+    ],
+    "angiogenesis_vegf": [
+        "VEGFA", "VEGFB", "VEGFC", "KDR", "FLT1", "FLT4", "PGF", "NRP1",
+        "NRP2", "ANGPT1", "ANGPT2", "TEK", "PECAM1", "CDH5", "ESM1",
+    ],
+    "endothelial_identity": [
+        "PECAM1", "CDH5", "VWF", "CLDN5", "ERG", "ACKR1", "PLVAP", "LDB2",
+        "MECOM", "EGFL7", "RAMP2", "SOX17",
+    ],
+    "smooth_muscle_contraction": [
+        "ACTA2", "MYH11", "TAGLN", "CNN1", "MYL9", "DES", "LMOD1", "PDGFRB",
+        "RGS5", "NOTCH3", "CALD1",
+    ],
+    "keratinization": [
+        "KRT5", "KRT14", "KRT15", "KRT17", "TP63", "CSTA", "SFN", "DSP",
+        "PKP1", "COL17A1", "LAMB3", "ITGB4",
+    ],
+    "neuroendocrine_program": [
+        "ASCL1", "NEUROD1", "CHGA", "CHGB", "SYP", "GRP", "CALCA", "SCG2",
+        "PCSK1", "INSM1", "SYT1", "PHOX2B",
+    ],
+    "adipogenesis": [
+        "PPARG", "CEBPA", "CEBPB", "ADIPOQ", "LEP", "PLIN1", "FABP4", "LPL",
+        "CIDEC", "CFD", "GPD1", "SLC2A4",
+    ],
+    "steroidogenesis": [
+        "STAR", "CYP11A1", "CYP11B1", "CYP17A1", "CYP21A2", "HSD3B2",
+        "NR5A1", "MC2R", "FDX1", "SCARB1",
+    ],
+    "melanocyte_pigmentation": [
+        "MITF", "TYR", "TYRP1", "DCT", "PMEL", "MLANA", "SOX10", "GPR143",
+        "OCA2", "SLC45A2",
+    ],
+    "hepatocyte_function": [
+        "ALB", "APOB", "APOA1", "TTR", "SERPINA1", "HNF4A", "CYP3A4",
+        "TF", "FGA", "FGB", "AHSG", "ASGR1",
+    ],
+}
+
+PATHWAY_CATEGORIES: Dict[str, List[str]] = {
+    "immune_signaling": [
+        "type_i_interferon", "interferon_gamma", "tnf_nfkb", "jak_stat",
+        "complement", "tlr_signaling", "chemokine_signaling",
+        "inflammatory_cytokines", "antigen_presentation_mhc_i",
+        "antigen_presentation_mhc_ii", "cytotoxicity", "t_cell_activation",
+        "t_cell_exhaustion", "b_cell_receptor", "inflammasome",
+        "immune_checkpoint",
+    ],
+    "cell_biology": [
+        "cell_cycle", "dna_replication", "dna_damage_response", "apoptosis",
+        "autophagy", "senescence", "mtor_signaling", "pi3k_akt", "mapk_erk",
+        "wnt_signaling", "notch_signaling", "hippo_yap", "hedgehog_signaling",
+        "tgf_beta_bmp", "ubiquitin_proteasome", "unfolded_protein_response",
+        "epithelial_mesenchymal_transition", "hypoxia",
+    ],
+    "neuroscience": [
+        "glutamatergic_synapse", "gabaergic_synapse", "synaptic_vesicle_cycle",
+        "neurogenesis", "myelination", "axon_guidance", "dopaminergic_neuron",
+        "neurodegeneration",
+    ],
+    "metabolism": [
+        "oxidative_phosphorylation", "glycolysis", "fatty_acid_oxidation",
+        "lipid_metabolism", "cholesterol_biosynthesis",
+        "amino_acid_metabolism", "one_carbon_metabolism",
+        "ros_oxidative_stress", "heme_iron_metabolism",
+    ],
+    "tissue_specific": [
+        "alveolar_surfactant", "surfactant_processing_trafficking",
+        "alveolar_type_1", "ciliogenesis", "mucin_secretion",
+        "epithelial_defense", "extracellular_matrix", "fibrosis",
+        "angiogenesis_vegf", "endothelial_identity",
+        "smooth_muscle_contraction", "keratinization",
+        "neuroendocrine_program", "adipogenesis", "steroidogenesis",
+        "melanocyte_pigmentation", "hepatocyte_function",
+    ],
+}
+
+PATHWAY_TO_CATEGORY = {p: cat for cat, ps in PATHWAY_CATEGORIES.items()
+                       for p in ps}
+
+# Names as they are actually written in papers -> canonical keys.
+# Without these, "pathway: IFN-gamma signaling" fails to resolve.
+PATHWAY_ALIASES = {
+    "ifn_gamma": "interferon_gamma",
+    "ifng": "interferon_gamma",
+    "ifn_g": "interferon_gamma",
+    "interferon_gamma_signaling": "interferon_gamma",
+    "type_i_ifn": "type_i_interferon",
+    "type_1_interferon": "type_i_interferon",
+    "interferon_alpha": "type_i_interferon",
+    "isg": "type_i_interferon",
+    "nfkb": "tnf_nfkb",
+    "nf_kb": "tnf_nfkb",
+    "tnf_alpha": "tnf_nfkb",
+    "mhc_i": "antigen_presentation_mhc_i",
+    "mhc_class_i": "antigen_presentation_mhc_i",
+    "mhc_ii": "antigen_presentation_mhc_ii",
+    "mhc_class_ii": "antigen_presentation_mhc_ii",
+    "checkpoint": "immune_checkpoint",
+    "exhaustion": "t_cell_exhaustion",
+    "surfactant": "alveolar_surfactant",
+    "surfactant_metabolism": "alveolar_surfactant",
+    "sftpc_trafficking": "surfactant_processing_trafficking",
+    "at1": "alveolar_type_1",
+    "at2": "alveolar_surfactant",
+    "cilia": "ciliogenesis",
+    "mucin": "mucin_secretion",
+    "mucus": "mucin_secretion",
+    "emt": "epithelial_mesenchymal_transition",
+    "oxphos": "oxidative_phosphorylation",
+    "wnt": "wnt_signaling",
+    "notch": "notch_signaling",
+    "hedgehog": "hedgehog_signaling",
+    "shh": "hedgehog_signaling",
+    "mtor": "mtor_signaling",
+    "erbb": "mapk_erk",
+    "erk": "mapk_erk",
+    "akt": "pi3k_akt",
+    "tgf_beta": "tgf_beta_bmp",
+    "bmp": "tgf_beta_bmp",
+    "vegf": "angiogenesis_vegf",
+    "angiogenesis": "angiogenesis_vegf",
+    "ecm": "extracellular_matrix",
+    "glycolytic": "glycolysis",
+    "ubiquitin": "ubiquitin_proteasome",
+    "upr": "unfolded_protein_response",
+    "er_stress": "unfolded_protein_response",
+}
+
+# Generic words that carry no discriminative signal when fuzzy-matching
+PATHWAY_STOPWORDS = {
+    "signaling", "signalling", "pathway", "pathways", "response",
+    "responses", "activity", "program", "programs", "cell", "the", "of",
+    "and", "in",
 }
 
 
 # ============================================================
 # BUILT-IN LIGAND-RECEPTOR TABLE
+# (ligand, receptor, pathway) — compiled from CellChat / CellPhoneDB /
+# NicheNet style resources, plus context pairs for lung, neuro, and
+# immune-checkpoint biology. The exact count is reported at runtime as
+# `lr_database_size` in the interactions payload.
 # ============================================================
-# (ligand, receptor, pathway)
+
 LR_PAIRS = [
-    ("WNT2", "FZD1", "WNT"), ("WNT5A", "FZD4", "WNT"),
-    ("WNT7B", "FZD1", "WNT"), ("RSPO2", "LGR5", "WNT"),
-    ("FGF7", "FGFR2", "FGF"), ("FGF10", "FGFR2", "FGF"),
-    ("FGF9", "FGFR3", "FGF"), ("FGF2", "FGFR1", "FGF"),
-    ("TGFB1", "TGFBR2", "TGFB"), ("TGFB2", "TGFBR2", "TGFB"),
-    ("TGFB1", "TGFBR1", "TGFB"), ("BMP4", "BMPR1A", "BMP"),
-    ("BMP2", "BMPR2", "BMP"), ("BMP5", "BMPR1B", "BMP"),
-    ("JAG1", "NOTCH1", "NOTCH"), ("JAG2", "NOTCH2", "NOTCH"),
-    ("DLL1", "NOTCH1", "NOTCH"), ("DLL4", "NOTCH4", "NOTCH"),
+    # ---- WNT ----
+    ("WNT1", "FZD1", "WNT"), ("WNT2", "FZD1", "WNT"),
+    ("WNT2B", "FZD4", "WNT"), ("WNT3", "FZD1", "WNT"),
+    ("WNT3A", "FZD1", "WNT"), ("WNT4", "FZD6", "WNT"),
+    ("WNT5A", "FZD4", "WNT"), ("WNT5A", "ROR2", "WNT"),
+    ("WNT5A", "RYK", "WNT"), ("WNT7A", "FZD5", "WNT"),
+    ("WNT7B", "FZD1", "WNT"), ("WNT9A", "FZD5", "WNT"),
+    ("WNT11", "FZD7", "WNT"), ("WNT16", "FZD4", "WNT"),
+    ("RSPO1", "LGR4", "WNT"), ("RSPO2", "LGR5", "WNT"),
+    ("RSPO3", "LGR5", "WNT"), ("DKK1", "LRP6", "WNT"),
+    ("SFRP1", "FZD1", "WNT"),
+
+    # ---- FGF ----
+    ("FGF1", "FGFR1", "FGF"), ("FGF2", "FGFR1", "FGF"),
+    ("FGF2", "FGFR2", "FGF"), ("FGF5", "FGFR1", "FGF"),
+    ("FGF7", "FGFR2", "FGF"), ("FGF8", "FGFR2", "FGF"),
+    ("FGF9", "FGFR3", "FGF"), ("FGF10", "FGFR1", "FGF"),
+    ("FGF10", "FGFR2", "FGF"), ("FGF13", "FGFR1", "FGF"),
+    ("FGF18", "FGFR3", "FGF"), ("FGF19", "FGFR4", "FGF"),
+    ("FGF21", "FGFR1", "FGF"), ("FGF23", "FGFR1", "FGF"),
+
+    # ---- TGFB / ACTIVIN ----
+    ("TGFB1", "TGFBR1", "TGFB"), ("TGFB1", "TGFBR2", "TGFB"),
+    ("TGFB2", "TGFBR2", "TGFB"), ("TGFB3", "TGFBR2", "TGFB"),
+    ("TGFB1", "ACVRL1", "TGFB"), ("INHBA", "ACVR2A", "ACTIVIN"),
+    ("INHBA", "ACVR1B", "ACTIVIN"), ("INHBB", "ACVR2B", "ACTIVIN"),
+    ("NODAL", "ACVR2B", "ACTIVIN"), ("LEFTY1", "ACVR2B", "ACTIVIN"),
+    ("GDF15", "GFRAL", "GDF"),
+
+    # ---- BMP ----
+    ("BMP2", "BMPR1A", "BMP"), ("BMP2", "BMPR2", "BMP"),
+    ("BMP3", "ACVR2B", "BMP"), ("BMP4", "BMPR1A", "BMP"),
+    ("BMP4", "BMPR2", "BMP"), ("BMP5", "BMPR1B", "BMP"),
+    ("BMP6", "BMPR1A", "BMP"), ("BMP7", "BMPR2", "BMP"),
+    ("BMP7", "ACVR1", "BMP"), ("BMP8B", "BMPR1A", "BMP"),
+    ("GDF5", "BMPR1B", "BMP"), ("GREM1", "BMPR2", "BMP"),
+
+    # ---- NOTCH ----
+    ("JAG1", "NOTCH1", "NOTCH"), ("JAG1", "NOTCH2", "NOTCH"),
+    ("JAG1", "NOTCH3", "NOTCH"), ("JAG1", "NOTCH4", "NOTCH"),
+    ("JAG2", "NOTCH1", "NOTCH"), ("JAG2", "NOTCH2", "NOTCH"),
+    ("DLL1", "NOTCH1", "NOTCH"), ("DLL1", "NOTCH2", "NOTCH"),
+    ("DLL3", "NOTCH1", "NOTCH"), ("DLL4", "NOTCH1", "NOTCH"),
+    ("DLL4", "NOTCH4", "NOTCH"), ("DLK1", "NOTCH1", "NOTCH"),
+
+    # ---- VEGF / ANGIOPOIETIN ----
     ("VEGFA", "KDR", "VEGF"), ("VEGFA", "FLT1", "VEGF"),
-    ("VEGFB", "FLT1", "VEGF"), ("PGF", "FLT1", "VEGF"),
-    ("VEGFC", "FLT4", "VEGF"), ("ANGPT1", "TEK", "ANGIOPOIETIN"),
-    ("ANGPT2", "TEK", "ANGIOPOIETIN"),
-    ("PDGFA", "PDGFRA", "PDGF"), ("PDGFB", "PDGFRB", "PDGF"),
-    ("SHH", "PTCH1", "HEDGEHOG"), ("IHH", "PTCH1", "HEDGEHOG"),
-    ("IGF1", "IGF1R", "IGF"), ("IGF2", "IGF2R", "IGF"),
-    ("HGF", "MET", "HGF"), ("NRG1", "ERBB3", "ERBB"),
-    ("EREG", "EGFR", "EGF"), ("HBEGF", "EGFR", "EGF"),
-    ("TGFA", "EGFR", "EGF"), ("AREG", "EGFR", "EGF"),
-    ("CXCL12", "CXCR4", "CHEMOKINE"), ("CCL2", "CCR2", "CHEMOKINE"),
-    ("CXCL8", "CXCR1", "CHEMOKINE"), ("CXCL8", "CXCR2", "CHEMOKINE"),
-    ("CCL5", "CCR5", "CHEMOKINE"), ("CXCL9", "CXCR3", "CHEMOKINE"),
-    ("CXCL10", "CXCR3", "CHEMOKINE"), ("CCL19", "CCR7", "CHEMOKINE"),
-    ("IL6", "IL6R", "CYTOKINE"), ("IL1B", "IL1R1", "CYTOKINE"),
-    ("TNF", "TNFRSF1A", "CYTOKINE"), ("IFNG", "IFNGR1", "CYTOKINE"),
-    ("IL10", "IL10RA", "CYTOKINE"), ("IL33", "IL1RL1", "CYTOKINE"),
-    ("CSF1", "CSF1R", "CYTOKINE"), ("TSLP", "CRLF2", "CYTOKINE"),
-    ("ICAM1", "ITGAL", "ADHESION"), ("VCAM1", "ITGA4", "ADHESION"),
-    ("COL4A1", "ITGB1", "ADHESION"), ("LAMA3", "ITGB4", "ADHESION"),
-    ("FN1", "ITGA5", "ADHESION"), ("SPP1", "CD44", "ADHESION"),
-    ("HLA-E", "KLRC1", "IMMUNE_CHECKPOINT"),
+    ("VEGFA", "NRP1", "VEGF"), ("VEGFB", "FLT1", "VEGF"),
+    ("VEGFC", "FLT4", "VEGF"), ("VEGFC", "KDR", "VEGF"),
+    ("PGF", "FLT1", "VEGF"), ("PGF", "NRP1", "VEGF"),
+    ("ANGPT1", "TEK", "ANGIOPOIETIN"), ("ANGPT2", "TEK", "ANGIOPOIETIN"),
+    ("ANGPTL4", "ITGB1", "ANGIOPOIETIN"), ("ESM1", "KDR", "VEGF"),
+    ("EGFL7", "NOTCH1", "VEGF"), ("APLN", "APLNR", "APELIN"),
+
+    # ---- PDGF ----
+    ("PDGFA", "PDGFRA", "PDGF"), ("PDGFA", "PDGFRB", "PDGF"),
+    ("PDGFB", "PDGFRA", "PDGF"), ("PDGFB", "PDGFRB", "PDGF"),
+    ("PDGFC", "PDGFRA", "PDGF"), ("PDGFC", "PDGFRB", "PDGF"),
+    ("PDGFD", "PDGFRA", "PDGF"), ("PDGFD", "PDGFRB", "PDGF"),
+
+    # ---- HEDGEHOG ----
+    ("SHH", "PTCH1", "HEDGEHOG"), ("SHH", "SMO", "HEDGEHOG"),
+    ("SHH", "GAS1", "HEDGEHOG"), ("IHH", "PTCH1", "HEDGEHOG"),
+    ("DHH", "PTCH1", "HEDGEHOG"),
+
+    # ---- IGF / INSULIN ----
+    ("IGF1", "IGF1R", "IGF"), ("IGF1", "INSR", "IGF"),
+    ("IGF2", "IGF1R", "IGF"), ("IGF2", "IGF2R", "IGF"),
+    ("IGF2", "INSR", "IGF"), ("INS", "INSR", "INSULIN"),
+    ("IGFBP3", "IGF1R", "IGF"), ("IGFBP5", "IGF1R", "IGF"),
+
+    # ---- HGF / TAM ----
+    ("HGF", "MET", "HGF"), ("MST1", "MST1R", "HGF"),
+    ("GAS6", "AXL", "TAM"), ("GAS6", "MERTK", "TAM"),
+    ("PROS1", "AXL", "TAM"), ("PROS1", "MERTK", "TAM"),
+
+    # ---- EGF / ERBB ----
+    ("EGF", "EGFR", "EGF"), ("TGFA", "EGFR", "EGF"),
+    ("HBEGF", "EGFR", "EGF"), ("HBEGF", "ERBB4", "EGF"),
+    ("AREG", "EGFR", "EGF"), ("EREG", "EGFR", "EGF"),
+    ("EREG", "ERBB4", "EGF"), ("BTC", "EGFR", "EGF"),
+    ("BTC", "ERBB4", "EGF"), ("EPGN", "EGFR", "EGF"),
+    ("NRG1", "ERBB3", "ERBB"), ("NRG1", "ERBB4", "ERBB"),
+    ("NRG2", "ERBB4", "ERBB"), ("NRG3", "ERBB4", "ERBB"),
+    ("NRG4", "ERBB4", "ERBB"),
+
+    # ---- CHEMOKINES ----
+    ("CXCL1", "CXCR2", "CHEMOKINE"), ("CXCL2", "CXCR2", "CHEMOKINE"),
+    ("CXCL3", "CXCR2", "CHEMOKINE"), ("CXCL5", "CXCR2", "CHEMOKINE"),
+    ("CXCL6", "CXCR1", "CHEMOKINE"), ("CXCL8", "CXCR1", "CHEMOKINE"),
+    ("CXCL8", "CXCR2", "CHEMOKINE"), ("CXCL9", "CXCR3", "CHEMOKINE"),
+    ("CXCL10", "CXCR3", "CHEMOKINE"), ("CXCL11", "CXCR3", "CHEMOKINE"),
+    ("CXCL12", "CXCR4", "CHEMOKINE"), ("CXCL12", "ACKR3", "CHEMOKINE"),
+    ("CXCL13", "CXCR5", "CHEMOKINE"), ("CXCL14", "CXCR4", "CHEMOKINE"),
+    ("CXCL16", "CXCR6", "CHEMOKINE"), ("CXCL17", "GPR35", "CHEMOKINE"),
+    ("CCL2", "CCR2", "CHEMOKINE"), ("CCL3", "CCR1", "CHEMOKINE"),
+    ("CCL3", "CCR5", "CHEMOKINE"), ("CCL4", "CCR5", "CHEMOKINE"),
+    ("CCL5", "CCR1", "CHEMOKINE"), ("CCL5", "CCR5", "CHEMOKINE"),
+    ("CCL7", "CCR2", "CHEMOKINE"), ("CCL8", "CCR2", "CHEMOKINE"),
+    ("CCL11", "CCR3", "CHEMOKINE"), ("CCL13", "CCR2", "CHEMOKINE"),
+    ("CCL17", "CCR4", "CHEMOKINE"), ("CCL19", "CCR7", "CHEMOKINE"),
+    ("CCL20", "CCR6", "CHEMOKINE"), ("CCL21", "CCR7", "CHEMOKINE"),
+    ("CCL22", "CCR4", "CHEMOKINE"), ("CCL25", "CCR9", "CHEMOKINE"),
+    ("CCL28", "CCR10", "CHEMOKINE"), ("CX3CL1", "CX3CR1", "CHEMOKINE"),
+    ("XCL1", "XCR1", "CHEMOKINE"),
+
+    # ---- INTERLEUKINS / CYTOKINES ----
+    ("IL1A", "IL1R1", "IL1"), ("IL1B", "IL1R1", "IL1"),
+    ("IL1RN", "IL1R1", "IL1"), ("IL18", "IL18R1", "IL1"),
+    ("IL33", "IL1RL1", "IL1"), ("IL36G", "IL1RL2", "IL1"),
+    ("IL2", "IL2RA", "IL2"), ("IL2", "IL2RB", "IL2"),
+    ("IL15", "IL2RB", "IL2"), ("IL15", "IL15RA", "IL2"),
+    ("IL7", "IL7R", "IL2"), ("IL9", "IL9R", "IL2"),
+    ("IL21", "IL21R", "IL2"), ("IL4", "IL4R", "IL4"),
+    ("IL13", "IL4R", "IL4"), ("IL13", "IL13RA1", "IL4"),
+    ("IL5", "IL5RA", "IL5"), ("IL6", "IL6R", "IL6"),
+    ("IL6", "IL6ST", "IL6"), ("IL11", "IL6ST", "IL6"),
+    ("LIF", "LIFR", "IL6"), ("OSM", "OSMR", "IL6"),
+    ("CNTF", "CNTFR", "IL6"), ("IL10", "IL10RA", "IL10"),
+    ("IL22", "IL22RA1", "IL10"), ("IL24", "IL20RB", "IL10"),
+    ("IL12A", "IL12RB1", "IL12"), ("IL23A", "IL12RB1", "IL12"),
+    ("IL17A", "IL17RA", "IL17"), ("IL17F", "IL17RA", "IL17"),
+    ("IL16", "CD4", "CYTOKINE"), ("IL34", "CSF1R", "CSF"),
+    ("TSLP", "CRLF2", "CYTOKINE"), ("CSF1", "CSF1R", "CSF"),
+    ("CSF2", "CSF2RA", "CSF"), ("CSF3", "CSF3R", "CSF"),
+    ("KITLG", "KIT", "GROWTH_FACTOR"), ("FLT3LG", "FLT3", "GROWTH_FACTOR"),
+    ("EPO", "EPOR", "GROWTH_FACTOR"), ("THPO", "MPL", "GROWTH_FACTOR"),
+
+    # ---- INTERFERONS ----
+    ("IFNG", "IFNGR1", "INTERFERON"), ("IFNG", "IFNGR2", "INTERFERON"),
+    ("IFNA1", "IFNAR1", "INTERFERON"), ("IFNA2", "IFNAR2", "INTERFERON"),
+    ("IFNB1", "IFNAR1", "INTERFERON"), ("IFNL1", "IFNLR1", "INTERFERON"),
+
+    # ---- TNF SUPERFAMILY ----
+    ("TNF", "TNFRSF1A", "TNF"), ("TNF", "TNFRSF1B", "TNF"),
+    ("LTA", "TNFRSF1A", "TNF"), ("LTB", "LTBR", "TNF"),
+    ("TNFSF10", "TNFRSF10A", "TNF"), ("TNFSF10", "TNFRSF10B", "TNF"),
+    ("FASLG", "FAS", "TNF"), ("TNFSF11", "TNFRSF11A", "TNF"),
+    ("TNFSF12", "TNFRSF12A", "TNF"), ("TNFSF13", "TNFRSF13B", "TNF"),
+    ("TNFSF13B", "TNFRSF13C", "TNF"), ("TNFSF14", "TNFRSF14", "TNF"),
+    ("TNFSF15", "TNFRSF25", "TNF"), ("CD40LG", "CD40", "TNF"),
+    ("CD70", "CD27", "TNF"), ("TNFSF4", "TNFRSF4", "TNF"),
+    ("TNFSF9", "TNFRSF9", "TNF"), ("TNFSF18", "TNFRSF18", "TNF"),
+
+    # ---- CHECKPOINT / CO-STIMULATION / ANTIGEN ----
     ("CD274", "PDCD1", "IMMUNE_CHECKPOINT"),
+    ("PDCD1LG2", "PDCD1", "IMMUNE_CHECKPOINT"),
+    ("CD80", "CTLA4", "IMMUNE_CHECKPOINT"),
+    ("CD86", "CTLA4", "IMMUNE_CHECKPOINT"),
+    ("CD80", "CD28", "CO_STIMULATION"),
+    ("CD86", "CD28", "CO_STIMULATION"),
+    ("ICOSLG", "ICOS", "CO_STIMULATION"),
+    ("HLA-E", "KLRC1", "IMMUNE_CHECKPOINT"),
+    ("HLA-E", "KLRC2", "IMMUNE_CHECKPOINT"),
+    ("HLA-E", "KLRD1", "IMMUNE_CHECKPOINT"),
+    ("NECTIN2", "TIGIT", "IMMUNE_CHECKPOINT"),
+    ("PVR", "TIGIT", "IMMUNE_CHECKPOINT"),
+    ("PVR", "CD226", "IMMUNE_CHECKPOINT"),
+    ("LGALS9", "HAVCR2", "IMMUNE_CHECKPOINT"),
+    ("CD47", "SIRPA", "IMMUNE_CHECKPOINT"),
+    ("CD24", "SIGLEC10", "IMMUNE_CHECKPOINT"),
+    ("BTLA", "TNFRSF14", "IMMUNE_CHECKPOINT"),
+    ("HLA-A", "CD8A", "ANTIGEN_PRESENTATION"),
+    ("HLA-B", "CD8A", "ANTIGEN_PRESENTATION"),
     ("HLA-DRA", "CD4", "ANTIGEN_PRESENTATION"),
-    ("EDN1", "EDNRA", "ENDOTHELIN"), ("SEMA3A", "NRP1", "SEMAPHORIN"),
-    ("PTN", "PTPRZ1", "PLEIOTROPHIN"), ("MDK", "LRP1", "MIDKINE"),
-    ("GRN", "SORT1", "GROWTH_FACTOR"), ("APOE", "LRP1", "LIPID"),
+    ("HLA-DRB1", "CD4", "ANTIGEN_PRESENTATION"),
+    ("HLA-DPA1", "CD4", "ANTIGEN_PRESENTATION"),
+
+    # ---- ADHESION / ECM ----
+    ("ICAM1", "ITGAL", "ADHESION"), ("ICAM1", "ITGAM", "ADHESION"),
+    ("ICAM2", "ITGAL", "ADHESION"), ("VCAM1", "ITGA4", "ADHESION"),
+    ("VCAM1", "ITGB1", "ADHESION"), ("SELE", "SELPLG", "ADHESION"),
+    ("SELP", "SELPLG", "ADHESION"), ("SELL", "CD34", "ADHESION"),
+    ("PECAM1", "PECAM1", "ADHESION"), ("CDH5", "CDH5", "ADHESION"),
+    ("FN1", "ITGA5", "ECM"), ("FN1", "ITGAV", "ECM"),
+    ("FN1", "ITGB1", "ECM"), ("FN1", "SDC4", "ECM"),
+    ("COL1A1", "ITGB1", "ECM"), ("COL1A1", "DDR1", "ECM"),
+    ("COL1A2", "ITGA2", "ECM"), ("COL3A1", "ITGB1", "ECM"),
+    ("COL4A1", "ITGB1", "ECM"), ("COL4A1", "ITGA1", "ECM"),
+    ("COL6A2", "ITGB1", "ECM"), ("LAMA3", "ITGA6", "ECM"),
+    ("LAMA3", "ITGB4", "ECM"), ("LAMB3", "ITGA3", "ECM"),
+    ("LAMC1", "ITGB1", "ECM"), ("NID1", "ITGB1", "ECM"),
+    ("AGRN", "DAG1", "ECM"), ("RELN", "ITGB1", "ECM"),
+    ("SPP1", "CD44", "ECM"), ("SPP1", "ITGAV", "ECM"),
+    ("HAS2", "CD44", "ECM"), ("THBS1", "CD47", "ECM"),
+    ("THBS1", "ITGB1", "ECM"), ("THBS2", "ITGB1", "ECM"),
+    ("TNC", "ITGB1", "ECM"), ("VTN", "ITGAV", "ECM"),
+    ("POSTN", "ITGAV", "ECM"), ("TGM2", "ITGB1", "ECM"),
+
+    # ---- EPHRIN / SEMAPHORIN / GUIDANCE ----
+    ("EFNA1", "EPHA2", "EPHRIN"), ("EFNA5", "EPHA4", "EPHRIN"),
+    ("EFNB1", "EPHB2", "EPHRIN"), ("EFNB2", "EPHB4", "EPHRIN"),
+    ("EFNB2", "EPHA4", "EPHRIN"), ("SEMA3A", "NRP1", "SEMAPHORIN"),
+    ("SEMA3C", "NRP1", "SEMAPHORIN"), ("SEMA3E", "PLXND1", "SEMAPHORIN"),
+    ("SEMA4D", "PLXNB1", "SEMAPHORIN"), ("SEMA6A", "PLXNA2", "SEMAPHORIN"),
+    ("SEMA7A", "ITGB1", "SEMAPHORIN"), ("NTN1", "DCC", "NETRIN"),
+    ("NTN1", "UNC5B", "NETRIN"), ("SLIT2", "ROBO1", "SLIT"),
+    ("SLIT2", "ROBO2", "SLIT"), ("SLIT3", "ROBO1", "SLIT"),
+
+    # ---- NEUROTROPHIN / GDNF ----
+    ("NGF", "NTRK1", "NEUROTROPHIN"), ("NGF", "NGFR", "NEUROTROPHIN"),
+    ("BDNF", "NTRK2", "NEUROTROPHIN"), ("NTF3", "NTRK3", "NEUROTROPHIN"),
+    ("GDNF", "RET", "GDNF"), ("GDNF", "GFRA1", "GDNF"),
+    ("NRTN", "GFRA2", "GDNF"), ("ARTN", "GFRA3", "GDNF"),
+
+    # ---- COMPLEMENT / INNATE / MISC ----
+    ("C3", "C3AR1", "COMPLEMENT"), ("C5", "C5AR1", "COMPLEMENT"),
+    ("C1QA", "CD93", "COMPLEMENT"), ("C1QB", "CD93", "COMPLEMENT"),
+    ("CALR", "LRP1", "PHAGOCYTOSIS"), ("CALR", "SCARF1", "PHAGOCYTOSIS"),
+    ("APOE", "LRP1", "LIPID"), ("APOE", "TREM2", "LIPID"),
+    ("APOE", "SORL1", "LIPID"), ("GRN", "SORT1", "GROWTH_FACTOR"),
+    ("MDK", "LRP1", "MIDKINE"), ("MDK", "SDC1", "MIDKINE"),
+    ("PTN", "PTPRZ1", "PLEIOTROPHIN"), ("PTN", "SDC3", "PLEIOTROPHIN"),
+    ("APP", "CD74", "APP"), ("MIF", "CD74", "MIF"),
+    ("MIF", "CXCR4", "MIF"), ("HMGB1", "TLR4", "DAMP"),
+    ("HMGB1", "AGER", "DAMP"), ("S100A8", "TLR4", "DAMP"),
+    ("S100A9", "AGER", "DAMP"), ("ANXA1", "FPR1", "ANNEXIN"),
+    ("ANXA1", "FPR2", "ANNEXIN"), ("LGALS1", "PTPRC", "GALECTIN"),
+    ("LGALS3", "LAG3", "GALECTIN"), ("TIMP1", "CD63", "MMP"),
+    ("PLAU", "PLAUR", "PLASMINOGEN"), ("SERPINE1", "LRP1", "PLASMINOGEN"),
+    ("EDN1", "EDNRA", "ENDOTHELIN"), ("EDN1", "EDNRB", "ENDOTHELIN"),
+    ("EDN3", "EDNRB", "ENDOTHELIN"), ("ADM", "CALCRL", "ADRENOMEDULLIN"),
+    ("CALCA", "CALCRL", "ADRENOMEDULLIN"), ("AGT", "AGTR1", "RAS"),
+    ("AGT", "AGTR2", "RAS"), ("VIP", "VIPR1", "NEUROPEPTIDE"),
+    ("ADCYAP1", "ADCYAP1R1", "NEUROPEPTIDE"),
+    ("NPY", "NPY1R", "NEUROPEPTIDE"), ("GAL", "GALR1", "NEUROPEPTIDE"),
+    ("GRP", "GRPR", "NEUROPEPTIDE"), ("POMC", "MC1R", "NEUROPEPTIDE"),
+    ("NAMPT", "INSR", "METABOLIC"), ("LEP", "LEPR", "METABOLIC"),
+    ("ADIPOQ", "ADIPOR1", "METABOLIC"), ("ADIPOQ", "ADIPOR2", "METABOLIC"),
 ]
 
 
@@ -288,10 +817,8 @@ class RetrievalEngine(_V3Wrapper):
             meta["reactome_terms"] = self.reactome_terms[key][:25]
         stats = self.gene_stats.get(key, {})
         if stats:
-            top = sorted(stats.keys(),
-                         key=lambda g: abs(_f(stats[g].get("logfc"))),
-                         reverse=True)[:25]
-            meta["top_markers"] = top
+            meta["top_markers"] = [e["gene"] for e in
+                                   self._gene_evidence(key, 25)]
             meta["n_de_genes"] = len(stats)
         if not meta.get("n_cells"):
             counts = self._cluster_counts()
@@ -391,7 +918,13 @@ class RetrievalEngine(_V3Wrapper):
             "condition_column": None,
             "condition_values": [],
             "condition_source": None,
+            "n_pathways": len(PATHWAYS),
+            "pathway_categories": {k: len(v)
+                                   for k, v in PATHWAY_CATEGORIES.items()},
             "available_pathways": sorted(PATHWAYS.keys()),
+            "lr_database_size": len(LR_PAIRS),
+            "fusion": "reciprocal_rank_fusion",
+            "rrf_k": RRF_K,
         }
 
         obs = self._obs()
@@ -439,27 +972,72 @@ class RetrievalEngine(_V3Wrapper):
         return caps
 
     # --------------------------------------------------------
-    # RESULT FORMATTING
+    # GENE EVIDENCE
     # --------------------------------------------------------
 
-    def _gene_evidence(self, cid: str, top_n: int = 25) -> List[dict]:
+    def _gene_evidence(self, cid: str, top_n: int = 25,
+                       min_pct_in: float = 0.10,
+                       max_padj: float = 0.05) -> List[dict]:
+        """
+        Enriched markers only, ranked by |log2FC| x specificity x detection.
+
+        Sorting by raw |log2FC| surfaces junk (TCR/BCR segments, lincRNAs,
+        olfactory receptors, unmapped ENSG ids) that is nominally extreme but
+        detected in a handful of cells. Requiring positive enrichment, a
+        minimum detection rate and adjusted-p significance removes it.
+        """
         stats = self.gene_stats.get(str(cid), {})
         if not stats:
             return []
-        ordered = sorted(stats.keys(),
-                         key=lambda g: abs(_f(stats[g].get("logfc"))),
-                         reverse=True)[:top_n]
+
+        def _score(s):
+            lf = _f(s.get("logfc"))
+            pin = _pct(s.get("pct_in"))
+            pout = _pct(s.get("pct_out"))
+            spec = max(pin - pout, 0.0)
+            return abs(lf) * (0.3 + spec) * pin
+
+        kept = []
+        for g, s in stats.items():
+            lf = _f(s.get("logfc"))
+            pin = _pct(s.get("pct_in"))
+            padj = _f(s.get("pval_adj"), 1.0)
+            if lf <= 0:
+                continue
+            if pin < min_pct_in:
+                continue
+            if padj > max_padj:
+                continue
+            kept.append((g, s, _score(s)))
+
+        # Relax progressively rather than returning an empty evidence block
+        if not kept:
+            for g, s in stats.items():
+                if _f(s.get("logfc")) > 0 and _pct(s.get("pct_in")) >= 0.05:
+                    kept.append((g, s, _score(s)))
+        if not kept:
+            for g, s in stats.items():
+                kept.append((g, s, _score(s)))
+
+        kept.sort(key=lambda t: -t[2])
         out = []
-        for g in ordered:
-            s = stats[g]
+        for g, s, sc in kept[:top_n]:
+            pin = _pct(s.get("pct_in"))
+            pout = _pct(s.get("pct_out"))
             out.append({
                 "gene": g,
                 "logfc": round(_f(s.get("logfc")), 4),
-                "pct_in": round(_pct(s.get("pct_in")), 4),
-                "pct_out": round(_pct(s.get("pct_out")), 4),
+                "pct_in": round(pin, 4),
+                "pct_out": round(pout, 4),
+                "specificity": round(max(pin - pout, 0.0), 4),
                 "pval_adj": _f(s.get("pval_adj"), 1.0),
+                "marker_score": round(sc, 4),
             })
         return out
+
+    # --------------------------------------------------------
+    # RESULT FORMATTING
+    # --------------------------------------------------------
 
     def _format_results(self, ranked, with_genes: bool = False,
                         top_n_genes: int = 25, mode: str = "semantic",
@@ -521,9 +1099,10 @@ class RetrievalEngine(_V3Wrapper):
                                [str(c) for c in self.cluster_ids],
                                scoring_mode=self._hybrid.gene_scoring_mode,
                                top_k=len(self.cluster_ids))
-        d = {cid: s for cid, s in ranked}
-        arr = np.array([d.get(str(c), 0.0) for c in self.cluster_ids], dtype=float)
-        mx = arr.max()
+        d = {str(cid): s for cid, s in ranked}
+        arr = np.array([d.get(str(c), 0.0) for c in self.cluster_ids],
+                       dtype=float)
+        mx = arr.max() if arr.size else 0.0
         if mx > 0:
             arr = arr / mx
         return arr
@@ -533,56 +1112,280 @@ class RetrievalEngine(_V3Wrapper):
         self._last_expr_sims = self._compute_all_expr_scores(text)
 
     # --------------------------------------------------------
-    # RETRIEVAL (v3 API, extended)
+    # THE TWO PIPELINES (kept separate — no implicit fusion)
+    # --------------------------------------------------------
+
+    def _semantic_ranked(self, text: str, top_k: int):
+        """BioBERT cosine similarity + name boost + synonym expansion."""
+        return [(str(c), float(s)) for c, s in
+                self._hybrid.query(text, top_k=top_k, force_mode="ontology")]
+
+    def _gene_ranked(self, text: str, top_k: int):
+        """Gene marker scoring against per-cluster DE profiles."""
+        genes = extract_gene_names(text, self.all_genes)
+        if not genes:
+            return []
+        ranked = gene_pipeline(genes, self.gene_stats,
+                               [str(c) for c in self.cluster_ids],
+                               scoring_mode=self._hybrid.gene_scoring_mode,
+                               top_k=top_k)
+        return [(str(c), float(s)) for c, s in ranked]
+
+    @staticmethod
+    def _rrf(ranked_lists, weights, k: int = RRF_K, top_k: int = 10):
+        """
+        Reciprocal rank fusion (manuscript Eq. 8):
+            RRF(d) = sum_r  w_r / (k + rank_r(d) + 1),  rank 0-indexed.
+        """
+        scores: Dict[str, float] = {}
+        for ranked, w in zip(ranked_lists, weights):
+            if not ranked or w <= 0:
+                continue
+            for rank, (cid, _s) in enumerate(ranked):
+                cid = str(cid)
+                scores[cid] = scores.get(cid, 0.0) + float(w) / (k + rank + 1)
+        return sorted(scores.items(), key=lambda kv: -kv[1])[:top_k]
+
+    # --------------------------------------------------------
+    # RETRIEVAL
     # --------------------------------------------------------
 
     def query_semantic(self, text: str, top_k: int = 10,
                        with_genes: bool = False, **_ignored) -> dict:
         self._refresh_diagnostics(text)
-        ranked = self._hybrid.query(text, top_k=top_k, force_mode="ontology")
-        return self._format_results(ranked, with_genes=with_genes,
-                                    mode="semantic", query=text)
+        ranked = self._semantic_ranked(text, top_k)
+        payload = self._format_results(ranked, with_genes=with_genes,
+                                       mode="semantic", query=text)
+        payload["pipeline"] = ("semantic (BioBERT cosine similarity, "
+                               "name boost alpha=0.15, "
+                               "synonym boost beta=0.10)")
+        return payload
 
     def query_hybrid(self, text: str, top_k: int = 10, lambda_sem: float = 0.5,
-                     with_genes: bool = False, pre_k: int = None,
+                     with_genes: bool = False, pre_k: int = 40,
                      gamma: float = None, **_ignored) -> dict:
         """
-        pre_k / gamma are accepted for v3 call-signature compatibility.
-        The v4 router does not use them; they are recorded in the payload
-        so reports remain honest about what was actually run.
+        Late fusion of the two independent pipelines via reciprocal rank
+        fusion, as described in the manuscript.
+
+        lambda_sem is the semantic pipeline weight:
+            0.0 -> pure gene marker scoring
+            0.5 -> balanced 1:1 fusion
+            1.0 -> pure semantic
+        pre_k is the candidate depth taken from each pipeline before fusion.
         """
         self._refresh_diagnostics(text)
-        if lambda_sem <= 0.1:
-            mode = "gene_list"
-        elif lambda_sem >= 0.9:
-            mode = "ontology"
-        else:
-            mode = "mixed"
-        ranked = self._hybrid.query(text, top_k=top_k, force_mode=mode)
+        n_clusters = len(self.cluster_ids)
+        pre_k = int(min(pre_k or n_clusters, n_clusters))
+
+        w_sem = float(max(0.0, min(1.0, lambda_sem)))
+        w_gene = 1.0 - w_sem
+
+        sem_ranked = self._semantic_ranked(text, pre_k) if w_sem > 0 else []
+        gene_ranked = self._gene_ranked(text, pre_k) if w_gene > 0 else []
+
+        query_genes = extract_gene_names(text, self.all_genes)
+
+        # Safety net: a gene-weighted query with no recognizable gene symbols
+        # would otherwise return nothing. Fall back to the semantic pipeline.
+        if not gene_ranked and not sem_ranked:
+            sem_ranked = self._semantic_ranked(text, pre_k)
+            w_sem, w_gene = 1.0, 0.0
+
+        ranked = self._rrf([sem_ranked, gene_ranked], [w_sem, w_gene],
+                           k=RRF_K, top_k=top_k)
+
         payload = self._format_results(ranked, with_genes=with_genes,
                                        mode="hybrid", query=text)
-        payload["router_mode"] = mode
-        payload["lambda_sem"] = lambda_sem
-        if pre_k is not None or gamma is not None:
-            payload["ignored_params"] = {"pre_k": pre_k, "gamma": gamma}
+        payload.update({
+            "fusion": "reciprocal_rank_fusion",
+            "rrf_k": RRF_K,
+            "lambda_sem": w_sem,
+            "weights": {"semantic": w_sem, "gene": w_gene},
+            "pre_k": pre_k,
+            "query_genes": query_genes,
+            "gene_pipeline_active": bool(gene_ranked),
+            "semantic_pipeline_active": bool(sem_ranked),
+        })
+        if gamma is not None:
+            payload["gamma_note"] = (
+                "gamma is a score-level reranking sharpness parameter and has "
+                "no effect under rank-based RRF; it was not applied.")
+        return payload
+
+    # Tokens that indicate natural language rather than a gene signature.
+    NL_HINT_TOKENS = {
+        "cell", "cells", "activation", "signaling", "signalling", "response",
+        "pathway", "expression", "infiltration", "differentiation", "marker",
+        "markers", "in", "of", "and", "with", "the", "during", "after",
+    }
+
+    def _gene_token_fraction(self, text: str) -> float:
+        """
+        Fraction of query tokens that are recognised gene symbols.
+        This is the same signal the query classifier uses, exposed as a
+        number so the union can break 'mixed' ties without any ground truth.
+        """
+        toks = [t for t in text.replace(",", " ").replace(";", " ").split()
+                if t.strip()]
+        if not toks:
+            return 0.0
+        known = {g.upper() for g in self.all_genes}
+        n_gene = sum(1 for t in toks if t.upper().strip(".,;:()") in known)
+        return n_gene / len(toks)
+
+    def query_union(self, text: str, top_k: int = 10,
+                    with_genes: bool = False, pre_k: int = 40,
+                    selection_mode: str = "classifier",
+                    expected_clusters: Optional[List[str]] = None,
+                    **_ignored) -> dict:
+        """
+        Additive union of the two pipelines.
+
+        The primary pipeline supplies its full ranked list; clusters unique to
+        the secondary are appended in their original rank order.
+
+        selection_mode controls how the primary is chosen:
+
+        * "classifier" (DEFAULT, and the only mode valid for reporting):
+          the primary is chosen by the query classifier, exactly as at
+          inference time. Gene-signature queries take the gene pipeline,
+          natural-language queries take the semantic pipeline, and mixed
+          queries are broken by the gene-token fraction. No ground truth is
+          consulted, so the result is directly comparable to any
+          single-system baseline.
+
+        * "oracle_recall": the primary is the pipeline with the higher
+          Recall@5 against `expected_clusters`. This CONSULTS THE ANSWER KEY.
+          Because the primary's top-5 is also the union's top-5, Recall@5
+          under this mode is algebraically identical to the per-query maximum
+          of the two pipelines. It is therefore an oracle UPPER BOUND, not a
+          system result, and must never be compared against baselines that
+          receive no such privilege. Payloads from this mode are stamped with
+          `oracle_assisted: True`.
+        """
+        self._refresh_diagnostics(text)
+        n_clusters = len(self.cluster_ids)
+        pre_k = int(min(pre_k or n_clusters, n_clusters))
+
+        sem_ranked = self._semantic_ranked(text, pre_k)
+        gene_ranked = self._gene_ranked(text, pre_k)
+        auto_mode = classify_query(text, self.all_genes)
+        gene_frac = self._gene_token_fraction(text)
+
+        oracle_assisted = False
+
+        if selection_mode == "oracle_recall":
+            if not expected_clusters:
+                return {"error": "selection_mode='oracle_recall' requires "
+                                 "expected_clusters."}
+
+            def _recall_at(ranked, expected, k=5):
+                if not ranked:
+                    return -1.0
+                exp = {str(e).lower() for e in expected}
+                got = [str(c).lower() for c, _ in ranked[:k]]
+                hit = sum(1 for e in exp if any(e in g or g in e for g in got))
+                return hit / len(exp)
+
+            sem_primary = (_recall_at(sem_ranked, expected_clusters)
+                           >= _recall_at(gene_ranked, expected_clusters))
+            selection = "oracle Recall@5 against expected_clusters"
+            oracle_assisted = True
+
+        elif selection_mode == "classifier":
+            if auto_mode == "gene_list":
+                sem_primary = False
+            elif auto_mode == "ontology":
+                sem_primary = True
+            else:  # mixed — break the tie on the gene-token fraction
+                sem_primary = gene_frac < 0.5
+            selection = f"query classifier ({auto_mode}, "
+            selection += f"gene token fraction {gene_frac:.2f})"
+        else:
+            return {"error": f"Unknown selection_mode '{selection_mode}'. "
+                             f"Use 'classifier' or 'oracle_recall'."}
+
+        # A pipeline that returned nothing cannot be primary.
+        if not gene_ranked:
+            sem_primary = True
+            selection += " [gene pipeline empty: no gene symbols in query]"
+        elif not sem_ranked:
+            sem_primary = False
+            selection += " [semantic pipeline empty]"
+
+        primary, secondary = ((sem_ranked, gene_ranked) if sem_primary
+                              else (gene_ranked, sem_ranked))
+        seen = set()
+        merged = []
+        for cid, s in list(primary) + list(secondary):
+            if cid in seen:
+                continue
+            seen.add(cid)
+            merged.append((cid, s))
+
+        n_appended = len(merged) - len(primary)
+        payload = self._format_results(merged[:max(top_k, 2 * top_k)],
+                                       with_genes=with_genes,
+                                       mode="union", query=text)
+        payload.update({
+            "strategy": "additive_union",
+            "selection_mode": selection_mode,
+            "primary_pipeline": "semantic" if sem_primary else "gene",
+            "primary_selected_by": selection,
+            "classified_as": auto_mode,
+            "gene_token_fraction": round(gene_frac, 3),
+            "pre_k": pre_k,
+            "n_primary": len(primary),
+            "n_appended_from_secondary": n_appended,
+        })
+        if oracle_assisted:
+            payload["oracle_assisted"] = True
+            payload["reporting_note"] = (
+                "Primary pipeline chosen using the answer key. Recall@5 here "
+                "equals the per-query maximum of the two pipelines by "
+                "construction. Report as an oracle upper bound only; do not "
+                "compare against single-system baselines.")
+        if n_appended == 0 and pre_k >= n_clusters:
+            payload["union_note"] = (
+                f"The secondary pipeline added nothing: pre_k ({pre_k}) covers "
+                f"all {n_clusters} clusters, so the primary list is already "
+                f"exhaustive. Lower pre_k for the additive step to have any "
+                f"effect.")
         return payload
 
     def query_annotation_only(self, text: str, top_k: int = 10,
                               with_genes: bool = False, **_ignored) -> dict:
         self._refresh_diagnostics(text)
-        ranked = self._hybrid.query(text, top_k=top_k, force_mode="ontology")
+        ranked = self._semantic_ranked(text, top_k)
         return self._format_results(ranked, with_genes=with_genes,
                                     mode="annotation", query=text)
 
     def discover(self, text: str, top_k: int = 5, lambda_sem: float = 0.5,
-                 pre_k: int = None, gamma: float = None, **_ignored) -> dict:
-        """Discovery mode: mixed routing plus enrichment context."""
+                 pre_k: int = 40, gamma: float = None,
+                 with_modules: bool = True, **_ignored) -> dict:
+        """
+        Discovery mode.
+
+        Per the manuscript, the language model receives the retrieved clusters
+        with their gene-level evidence AND the outputs of the analytical
+        modules (pathway scoring, ligand-receptor inference). Both are
+        assembled here so the prompt carries the full evidence package.
+        """
         self._refresh_diagnostics(text)
         auto_mode = classify_query(text, self.all_genes)
-        force = "mixed" if auto_mode == "mixed" else auto_mode
-        ranked = self._hybrid.query(text, top_k=top_k, force_mode=force)
-        payload = self._format_results(ranked, with_genes=True,
-                                       mode="discovery", query=text)
+
+        # Route the fusion weight by query type, then fuse (never implicit).
+        if auto_mode == "gene_list":
+            lam = 0.0
+        elif auto_mode == "ontology":
+            lam = 1.0
+        else:
+            lam = float(lambda_sem)
+
+        payload = self.query_hybrid(text, top_k=top_k, lambda_sem=lam,
+                                    with_genes=True, pre_k=pre_k)
+        payload["mode"] = "discovery"
         payload["classified_as"] = auto_mode
         payload["query_genes"] = extract_gene_names(text, self.all_genes)
 
@@ -594,16 +1397,41 @@ class RetrievalEngine(_V3Wrapper):
                 entry["go_terms"] = go[:10]
             if react:
                 entry["reactome_terms"] = react[:10]
+
+        if with_modules:
+            hits = [r["cluster_id"] for r in payload["results"]]
+            try:
+                pw = self.pathway()
+                payload["pathway_context"] = [
+                    p for p in pw.get("ranked", [])[:12]
+                ]
+                payload["pathway_caveat"] = pw.get("caveat")
+            except Exception as e:
+                payload["pathway_context_error"] = f"{type(e).__name__}: {e}"
+            try:
+                inter = self.interactions(max_results=40)
+                rel = [it for it in inter.get("interactions", [])
+                       if it["source"] in hits or it["target"] in hits][:15]
+                payload["interaction_context"] = {
+                    "n_total": inter.get("n_total"),
+                    "top_involving_retrieved_clusters": rel,
+                    "pathway_summary": inter.get("pathway_summary", [])[:8],
+                }
+                payload["interaction_caveat"] = inter.get("caveat")
+            except Exception as e:
+                payload["interaction_context_error"] = f"{type(e).__name__}: {e}"
+
         return payload
 
     def lambda_sweep(self, query: str, top_k: int = 5) -> dict:
         """
-        Sweep the semantic/expression blend and report, at each lambda,
-        the fraction of query genes covered by the returned clusters'
-        marker sets. Falls back to rank-overlap when the query has no genes.
+        Sweep the semantic/expression fusion weight and report, at each lambda,
+        the fraction of query genes covered by the returned clusters' marker
+        sets. Falls back to rank overlap when the query has no gene symbols.
         """
         lambdas = [round(x * 0.1, 1) for x in range(11)]
-        query_genes = [g.upper() for g in extract_gene_names(query, self.all_genes)]
+        query_genes = [g.upper() for g in extract_gene_names(query,
+                                                             self.all_genes)]
         coverages = []
         baseline = None
 
@@ -624,13 +1452,15 @@ class RetrievalEngine(_V3Wrapper):
                     baseline = set(cids)
                     coverages.append(1.0)
                 else:
-                    coverages.append(len(baseline & set(cids)) / max(len(baseline), 1))
+                    coverages.append(len(baseline & set(cids))
+                                     / max(len(baseline), 1))
 
         return {
             "query": query,
             "lambdas": lambdas,
             "coverages": coverages,
-            "metric": "query_gene_coverage" if query_genes else "rank_overlap_vs_lambda0",
+            "metric": ("query_gene_coverage" if query_genes
+                       else "rank_overlap_vs_lambda0"),
             "top_k": top_k,
         }
 
@@ -683,15 +1513,18 @@ class RetrievalEngine(_V3Wrapper):
                     "fraction": round(v / sub_total, 5),
                 } for k, v in vc.items()]
                 clusters.sort(key=lambda r: -r["n_cells"])
-                cond_props[cond] = {"total_cells": sub_total, "clusters": clusters}
+                cond_props[cond] = {"total_cells": sub_total,
+                                    "clusters": clusters}
 
             payload["condition_column"] = col
             payload["condition_proportions"] = cond_props
 
             if len(cond_props) == 2:
                 a, b = list(cond_props.keys())
-                fa = {c["cluster_id"]: c["fraction"] for c in cond_props[a]["clusters"]}
-                fb = {c["cluster_id"]: c["fraction"] for c in cond_props[b]["clusters"]}
+                fa = {c["cluster_id"]: c["fraction"]
+                      for c in cond_props[a]["clusters"]}
+                fb = {c["cluster_id"]: c["fraction"]
+                      for c in cond_props[b]["clusters"]}
                 fcs = []
                 for cid in set(fa) | set(fb):
                     va, vb = fa.get(cid, 0.0), fb.get(cid, 0.0)
@@ -735,7 +1568,8 @@ class RetrievalEngine(_V3Wrapper):
         b = vals.get(str(group_b).lower())
         if a is None or b is None:
             return {"error": f"Unknown condition(s). Available: "
-                             f"{caps['condition_values']}"}
+                             f"{caps['condition_values']}",
+                    "available": caps["condition_values"]}
 
         labels = obs[col].astype(str)
         clusters = obs[ckey].astype(str)
@@ -756,7 +1590,10 @@ class RetrievalEngine(_V3Wrapper):
                 f"n_{b}": cb,
                 f"fraction_{a}": round(fa, 5),
                 f"fraction_{b}": round(fb, 5),
-                "log2_fold_change": round(math.log2((fa + 1e-6) / (fb + 1e-6)), 4),
+                "log2_fold_change": round(
+                    math.log2((fa + 1e-6) / (fb + 1e-6)), 4),
+                "condition_bias": (a if fa > 0.6 * (fa + fb) else
+                                   (b if fb > 0.6 * (fa + fb) else "none")),
                 "genes": [],
             }
 
@@ -770,15 +1607,15 @@ class RetrievalEngine(_V3Wrapper):
                 gene_note = ("Mean log-normalized expression and percent "
                              "expressing, per cluster per condition. "
                              "Descriptive only — no statistical test applied.")
+                upper_map = {}
+                for i, v in enumerate(self._adata.var_names):
+                    upper_map.setdefault(str(v).upper(), i)
+
                 for g in genes:
-                    gu = g.upper()
-                    if gu not in {v.upper() for v in self._adata.var_names}:
+                    idx = upper_map.get(g.upper())
+                    if idx is None:
                         continue
-                    idx = [i for i, v in enumerate(self._adata.var_names)
-                           if str(v).upper() == gu]
-                    if not idx:
-                        continue
-                    vec = self._adata.X[:, idx[0]]
+                    vec = self._adata.X[:, idx]
                     try:
                         from scipy import sparse
                         if sparse.issparse(vec):
@@ -821,6 +1658,7 @@ class RetrievalEngine(_V3Wrapper):
             f"n_cells_{b}": n_b,
             "clusters": cluster_block,
             "fold_change_direction": f"positive = enriched in {a}",
+            "condition_bias_threshold": 0.6,
             "caveat": "Cluster fold changes are compositional. "
                       "No formal differential-abundance test was run.",
             "gene_note": gene_note,
@@ -830,69 +1668,92 @@ class RetrievalEngine(_V3Wrapper):
     # PATHWAY
     # --------------------------------------------------------
 
+    METRIC_DESC = ("mean pct_in across pathway genes detected in the "
+                   "cluster's DE profile; requires >= 3 detected genes for a "
+                   "non-zero score; coverage = detected/pathway size")
+    MIN_PATHWAY_GENES = 3
+
     def _score_pathway_in_cluster(self, cid: str, pathway_genes: List[str]):
         stats = self.gene_stats.get(str(cid), {})
         if not stats:
-            return 0.0, []
+            return 0.0, [], 0.0
         upper = {g.upper(): s for g, s in stats.items()}
         hits = []
         for g in pathway_genes:
             s = upper.get(g.upper())
             if s is None:
                 continue
-            lf = _f(s.get("logfc"))
             pin = _pct(s.get("pct_in"))
             pout = _pct(s.get("pct_out"))
-            spec = max(pin - pout, 0.0)
             hits.append({
                 "gene": g,
-                "logfc": round(lf, 4),
                 "pct_in": round(pin, 4),
-                "contribution": round(max(lf, 0.0) * (0.3 + spec), 4),
+                "pct_out": round(pout, 4),
+                "logfc": round(_f(s.get("logfc")), 4),
+                "specificity": round(max(pin - pout, 0.0), 4),
             })
-        if not hits:
-            return 0.0, []
-        total = sum(h["contribution"] for h in hits)
-        score = total / len(pathway_genes)
-        hits.sort(key=lambda h: -h["contribution"])
-        return score, hits
+        coverage = len(hits) / max(len(pathway_genes), 1)
+        if len(hits) < self.MIN_PATHWAY_GENES:
+            return 0.0, hits, round(coverage, 4)
+        score = sum(h["pct_in"] for h in hits) / len(hits)
+        hits.sort(key=lambda h: -h["pct_in"])
+        return score, hits, round(coverage, 4)
 
     def pathway(self, pathway_name: str = None) -> dict:
-        metric = ("mean marker-enrichment score over pathway genes "
-                  "(max(logFC,0) x (0.3 + specificity)), normalized by "
-                  "pathway size")
+        caveat = ("Scores derive from per-cluster marker/DE statistics, not "
+                  "per-cell expression. This is an enrichment proxy, not "
+                  "AUCell or ssGSEA.")
 
         if pathway_name is None or str(pathway_name).lower() == "all":
             ranked = []
             for name, genes in PATHWAYS.items():
                 per_cluster = []
                 for cid in self.cluster_ids:
-                    sc, hits = self._score_pathway_in_cluster(str(cid), genes)
-                    per_cluster.append((str(cid), sc, len(hits)))
+                    sc, hits, cov = self._score_pathway_in_cluster(str(cid),
+                                                                   genes)
+                    per_cluster.append((str(cid), sc, len(hits), cov))
                 per_cluster.sort(key=lambda t: -t[1])
-                top = per_cluster[0] if per_cluster else (None, 0.0, 0)
+                top = per_cluster[0] if per_cluster else (None, 0.0, 0, 0.0)
                 ranked.append({
                     "pathway": name,
+                    "category": PATHWAY_TO_CATEGORY.get(name, "uncategorized"),
                     "top_cluster": top[0],
                     "top_score": round(top[1], 4),
-                    "n_genes_found": top[2],
+                    "n_genes_detected": top[2],
+                    "coverage": top[3],
                     "pathway_size": len(genes),
                 })
             ranked.sort(key=lambda r: -r["top_score"])
             return {
                 "query": "all pathways",
                 "mode": "pathway",
-                "metric": metric,
+                "metric": self.METRIC_DESC,
+                "n_pathways": len(PATHWAYS),
+                "categories": {k: len(v)
+                               for k, v in PATHWAY_CATEGORIES.items()},
                 "ranked": ranked,
-                "caveat": "Scores derive from per-cluster marker statistics, "
-                          "not per-cell expression. Not AUCell/ssGSEA.",
+                "caveat": caveat,
             }
 
         key = str(pathway_name).strip().lower().replace(" ", "_").replace("-", "_")
+        key = PATHWAY_ALIASES.get(key, key)
         if key not in PATHWAYS:
-            matches = [p for p in PATHWAYS if key in p]
-            if len(matches) == 1:
-                key = matches[0]
+            # word-overlap fuzzy matching, ignoring generic words
+            toks = {t for t in key.split("_")
+                    if t and t not in PATHWAY_STOPWORDS}
+            scored = []
+            for p in PATHWAYS:
+                ptoks = {t for t in p.split("_")
+                         if t and t not in PATHWAY_STOPWORDS}
+                union = toks | ptoks
+                overlap = len(toks & ptoks) / max(len(union), 1)
+                if key in p or p in key:
+                    overlap += 0.5
+                if overlap > 0:
+                    scored.append((overlap, p))
+            scored.sort(reverse=True)
+            if scored and scored[0][0] >= 0.3:
+                key = scored[0][1]
             else:
                 return {
                     "error": f"Unknown pathway '{pathway_name}'",
@@ -902,11 +1763,12 @@ class RetrievalEngine(_V3Wrapper):
         genes = PATHWAYS[key]
         scores = []
         for cid in self.cluster_ids:
-            sc, hits = self._score_pathway_in_cluster(str(cid), genes)
+            sc, hits, cov = self._score_pathway_in_cluster(str(cid), genes)
             scores.append({
                 "cluster_id": str(cid),
                 "score": round(sc, 4),
-                "n_genes_found": len(hits),
+                "n_genes_detected": len(hits),
+                "coverage": cov,
                 "top_genes": hits[:8],
             })
         scores.sort(key=lambda r: -r["score"])
@@ -915,43 +1777,55 @@ class RetrievalEngine(_V3Wrapper):
             "query": key,
             "mode": "pathway",
             "pathway": key,
-            "metric": metric,
+            "category": PATHWAY_TO_CATEGORY.get(key, "uncategorized"),
+            "metric": self.METRIC_DESC,
+            "min_genes_required": self.MIN_PATHWAY_GENES,
             "genes_in_pathway": genes,
             "scores": scores,
-            "caveat": "Scores derive from per-cluster marker statistics, "
-                      "not per-cell expression. Not AUCell/ssGSEA.",
+            "caveat": caveat,
         }
 
     # --------------------------------------------------------
     # INTERACTIONS
     # --------------------------------------------------------
 
-    def _enriched_genes(self, cid: str, min_pct: float = 0.20,
-                        min_logfc: float = 0.10) -> Dict[str, float]:
-        out = {}
-        for g, s in self.gene_stats.get(str(cid), {}).items():
-            pin = _pct(s.get("pct_in"))
-            lf = _f(s.get("logfc"))
-            if pin >= min_pct and lf >= min_logfc:
-                out[g.upper()] = pin
-        return out
+    def _expressed_pct(self, cid: str) -> Dict[str, float]:
+        """Gene -> pct_in for every gene present in the cluster's DE profile."""
+        return {g.upper(): _pct(s.get("pct_in"))
+                for g, s in self.gene_stats.get(str(cid), {}).items()}
 
     def interactions(self, source: str = None, target: str = None,
-                     max_results: int = 200) -> dict:
-        expressed = {str(c): self._enriched_genes(str(c)) for c in self.cluster_ids}
+                     max_results: int = 200,
+                     min_ligand_pct: float = 0.10,
+                     min_receptor_pct: float = 0.05,
+                     include_self: bool = False) -> dict:
+        """
+        Ligand-receptor scoring as described in the manuscript:
 
-        src_list = [self._cid(source)] if source else [str(c) for c in self.cluster_ids]
-        tgt_list = [self._cid(target)] if target else [str(c) for c in self.cluster_ids]
+            s_ij = pct_in(ligand, c_i) * pct_in(receptor, c_j)
+
+        filtered at ligand >= 0.10 and receptor >= 0.05, self-interactions
+        excluded by default.
+        """
+        expressed = {str(c): self._expressed_pct(str(c))
+                     for c in self.cluster_ids}
+
+        src_list = ([self._cid(source)] if source
+                    else [str(c) for c in self.cluster_ids])
+        tgt_list = ([self._cid(target)] if target
+                    else [str(c) for c in self.cluster_ids])
 
         found = []
         for lig, rec, pw in LR_PAIRS:
             for s in src_list:
-                pl = expressed.get(s, {}).get(lig)
-                if not pl:
+                pl = expressed.get(s, {}).get(lig, 0.0)
+                if pl < min_ligand_pct:
                     continue
                 for t in tgt_list:
-                    pr = expressed.get(t, {}).get(rec)
-                    if not pr:
+                    if t == s and not include_self:
+                        continue
+                    pr = expressed.get(t, {}).get(rec, 0.0)
+                    if pr < min_receptor_pct:
                         continue
                     found.append({
                         "source": s,
@@ -1011,6 +1885,10 @@ class RetrievalEngine(_V3Wrapper):
             "pathway_summary": pathway_summary,
             "pair_summary": pair_summary,
             "lr_database_size": len(LR_PAIRS),
+            "score_definition": "pct_in(ligand, source) * pct_in(receptor, target)",
+            "thresholds": {"min_ligand_pct": min_ligand_pct,
+                           "min_receptor_pct": min_receptor_pct,
+                           "self_interactions": include_self},
             "caveat": "Predicted from co-enrichment of ligand and receptor in "
                       "per-cluster marker statistics. Not a validated "
                       "interaction inference method; no null model or "
@@ -1018,7 +1896,7 @@ class RetrievalEngine(_V3Wrapper):
         }
         if n_total == 0:
             payload["note"] = ("No ligand-receptor pairs from the built-in "
-                               "table were co-enriched. With 5 clusters and a "
-                               "restricted marker set this is expected; "
-                               "lower min_pct in _enriched_genes to loosen.")
+                               "table passed the expression thresholds. Try "
+                               "engine.interactions(min_ligand_pct=0.05, "
+                               "min_receptor_pct=0.02) or include_self=True.")
         return payload
