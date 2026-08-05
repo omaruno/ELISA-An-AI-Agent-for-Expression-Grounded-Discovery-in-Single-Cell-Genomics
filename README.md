@@ -97,7 +97,13 @@ Start the ELISA chat interface for interactive querying, analysis, and report ge
 export GROQ_API_KEY=your-key-here
 
 # Launch ELISA (default settings — good for Groq free tier)
-python elisa_chat_v4.py --h5ad /path/to/dataset.h5ad --cluster-key cell_type
+python elisa_chat_v4.py \
+  --base   /path/to/embeddings/Fibrosi_Cistica \
+  --pt-name hybrid_v3_DT1_FibrosiCistica.pt \
+  --h5ad   /path/to/Fibrosi_cistica.h5ad \
+  --cluster-key cell_type \
+  --hybrid-lambda 0.5 \
+  --pre-k 40
 
 # For larger models (GPT-4o, Claude) — increase token limits:
 export LLM_PROVIDER=openai
@@ -134,48 +140,45 @@ python elisa_chat_v4.py --h5ad /path/to/dataset.h5ad --cluster-key cell_type
 **Example session:**
 
 ```
-ELISA> semantic: macrophage infiltration in CF airways
-ELISA> hybrid: CD8 T cell activation and cytotoxicity
-ELISA> discover: HLA-E NKG2A immune checkpoint in cystic fibrosis
+# ─── ispezione dataset ───────────────────────────────────
+info
+clusters
+pathways
+genes: KLR
 
-ELISA> compare: CF vs Ctrl | IFNG, CD69, HLA-E
-ELISA> interactions: macrophage -> CD8-positive, alpha-beta T cell
-ELISA> pathway: IFN-gamma signaling
-ELISA> proportions
+# ─── retrieval ───────────────────────────────────────────
+semantic: macrophage infiltration in CF airways
+semantic: HLA-E CD94 NKG2A immune checkpoint inhibiting CD8 T cell activity
+hybrid: CD8A CD8B GZMB PRF1 IFNG NKG7
+hybrid: MARCO FABP4 APOC1 C1QB C1QC MSR1
+union: HLA-E NKG2A immune checkpoint and CD8 T cell inhibition in CF
+discover: HLA-E NKG2A immune checkpoint in cystic fibrosis
 
-ELISA> plot:umap
-ELISA> plot:expr HLA-E
-ELISA> plot:dotplot IFNG GZMB PRF1 NKG7
+# ─── moduli analitici ────────────────────────────────────
+proportions
+compare: cystic fibrosis vs normal
+compare: cystic fibrosis vs normal | IFNG, CD69, HLA-E, KLRC1, KLRD1
+interactions
+interactions: macrophage -> CD8-positive, alpha-beta T cell
+pathway: IFN-gamma signaling
+pathway: cytotoxicity
+pathway: all
 
-ELISA> report
+# ─── visualizzazione ─────────────────────────────────────
+plot:umap
+plot:umap CD8-positive, alpha-beta T cell, natural killer cell
+plot:expr HLA-E
+plot:dotplot IFNG, GZMB, PRF1, NKG7, HLA-E, KLRC1
+plot:genes
+plot:waterfall
+plot:scatter
+plot:lambda_sweep CD8A GZMB PRF1 NKG7
+
+# ─── report ──────────────────────────────────────────────
+report: md
+report
+quit
 ```
-
----
-
-## Chat Commands
-
-| Command | Description |
-|---------|-------------|
-| `semantic: <query>` | Semantic retrieval (BioBERT cosine similarity) |
-| `hybrid: <query>` | Gene marker scoring pipeline (scGPT mode) |
-| `discover: <query>` | Discovery mode with 4-section structured output |
-| `compare: A vs B` | Comparative analysis between two conditions |
-| `compare: A vs B \| gene1, gene2` | Comparative analysis focused on specific genes |
-| `interactions` | Predict all ligand–receptor interactions |
-| `interactions: source -> target` | Interactions between specific cell types |
-| `proportions` | Cell type proportion analysis |
-| `pathway: <name>` | Score a specific pathway across clusters |
-| `pathway: all` | Score all 60+ curated pathways |
-| `info` | Show dataset capabilities and cluster list |
-| `genes` | List all genes in the dataset |
-| `genes: <prefix>` | Search genes by prefix |
-| `plot:umap` | Cell-level UMAP (requires `--h5ad`) |
-| `plot:expr <gene>` | Gene expression UMAP |
-| `plot:dotplot <genes>` | Dot plot of gene expression across clusters |
-| `plot:grid <genes>` | Multi-gene expression grid |
-| `report` | Generate DOCX report of all analyses |
-| `report: md` | Generate Markdown report |
-| `export` | Export last result as JSON |
 
 ---
 
