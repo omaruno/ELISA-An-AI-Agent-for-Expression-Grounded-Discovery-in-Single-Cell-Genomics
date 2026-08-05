@@ -34,7 +34,7 @@ except ImportError:
     _PROVIDER_MAX_CHARS = None
 
 # IMPORTANT: the compat layer, not the bare v3 shim.
-from elisa_engine_compat import RetrievalEngine
+from retrieval_engine_v4_hybrid import RetrievalEngine
 from elisa_report import ReportBuilder
 import elisa_viz as viz
 
