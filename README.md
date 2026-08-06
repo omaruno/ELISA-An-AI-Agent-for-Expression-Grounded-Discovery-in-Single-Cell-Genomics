@@ -34,7 +34,6 @@ python generate_scgpt_embeddings.py \
 | `--cluster-key` | Column in `adata.obs` with cell type labels | auto-detected |
 | `--model-dir` | Directory with scGPT model files | `/lustre/home/ocoser/aiagents/scgptHuman` |
 | `--batch-size` | Cells per inference batch | `64` |
-| `--max-tokens` | Maximum gene tokens per cell | `3000` |
 | `--save-cell-emb` | Also save per-cell embeddings as `.npy` | `False` |
 
 **Output:**
