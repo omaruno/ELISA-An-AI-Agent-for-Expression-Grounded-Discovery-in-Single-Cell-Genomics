@@ -1,22 +1,24 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-ELISA – LLM Provider Abstraction (v3 — Groq, Gemini, OpenAI, Claude)
-======================================================================
+ELISA – LLM Provider Abstraction (v4 — Groq, Gemini, OpenAI, Mercury, Claude)
+==============================================================================
 Supports:
   - groq    → Groq Cloud   (Llama 3.1 8B, free: 500K tokens/day)
   - gemini  → Google AI    (Gemini 2.5 Flash, paid: ~$0.15/1M input)
   - openai  → OpenAI       (GPT-4o-mini, paid: ~$0.15/1M input)
+  - mercury → Inception    (Mercury 2 dLLM, paid: ~$0.25/1M input)
   - claude  → Anthropic    (Claude Sonnet 4, paid: ~$3/1M input)
 
-Groq, Gemini, and OpenAI use the OpenAI-compatible chat.completions API.
+Groq, Gemini, OpenAI, and Mercury use the OpenAI-compatible chat.completions API.
 Claude uses the native Anthropic SDK (pip install anthropic).
 
 Configuration (environment variables):
-  LLM_PROVIDER       = "groq" | "gemini" | "openai" | "claude"  (default: "groq")
+  LLM_PROVIDER       = "groq" | "gemini" | "openai" | "mercury" | "claude"  (default: "groq")
   GROQ_API_KEY        = your Groq key           (required if provider=groq)
   GEMINI_API_KEY      = your Google AI key       (required if provider=gemini)
   OPENAI_API_KEY      = your OpenAI key          (required if provider=openai)
+  INCEPTION_API_KEY   = your Inception key       (required if provider=mercury)
   ANTHROPIC_API_KEY   = your Anthropic key       (required if provider=claude)
   LLM_MODEL           = override model name      (optional)
   LLM_MAX_SPEND_EUR   = max spending in EUR      (default: 1.0)
@@ -29,6 +31,15 @@ Safety:
     estimated cost exceeds LLM_MAX_SPEND_EUR (default €1.00)
   - Auto-retry with exponential backoff on 429 errors
   - This is a HARD cap in code — independent of any cloud budgets
+
+Notes on Mercury (Inception Labs):
+  - Diffusion LLM (dLLM): generates tokens in parallel, ~5-10x faster than
+    comparable autoregressive models. Useful when ELISA makes many small calls.
+  - Endpoint: https://api.inceptionlabs.ai/v1  (OpenAI-compatible)
+  - Models: "mercury-2" (128K context, reasoning + tool use),
+            "mercury-edit-2" (32K context, code editing / autocomplete)
+  - New API keys come with 10M free tokens.
+  - Docs: https://docs.inceptionlabs.ai/get-started/get-started
 """
 
 import os
@@ -70,6 +81,16 @@ _PROVIDERS = {
         # GPT-4o-mini pricing (overestimates for safety)
         "cost_per_1m_input": 0.20,       # real: ~$0.15
         "cost_per_1m_output": 0.80,      # real: ~$0.60
+    },
+    "mercury": {
+        "env_key": "INCEPTION_API_KEY",
+        "base_url": "https://api.inceptionlabs.ai/v1",
+        "default_model": "mercury-2",
+        "label": "Inception (Mercury 2 dLLM)",
+        "api_style": "openai",           # OpenAI-compatible endpoint
+        # Mercury 2 pricing (overestimates for safety)
+        "cost_per_1m_input": 0.35,       # real: ~$0.25 ($0.025 cached)
+        "cost_per_1m_output": 1.00,      # real: ~$0.75
     },
     "claude": {
         "env_key": "ANTHROPIC_API_KEY",
@@ -147,8 +168,11 @@ _tracker = SpendingTracker(max_spend_eur=_MAX_SPEND)
 #   Free/small models (Llama 8B on Groq):
 #     LLM_MAX_OUTPUT_TOKENS=1024  LLM_MAX_INPUT_CHARS=18000
 #
-#   Large context models (GPT-4o, Claude Sonnet):
+#   Large context models (GPT-4o, Claude Sonnet, Mercury 2 @ 128K):
 #     LLM_MAX_OUTPUT_TOKENS=4096  LLM_MAX_INPUT_CHARS=60000
+#
+#   Mercury Edit 2 (32K context):
+#     LLM_MAX_OUTPUT_TOKENS=2048  LLM_MAX_INPUT_CHARS=40000
 #
 #   Local / open-source models (Ollama, vLLM):
 #     LLM_MAX_OUTPUT_TOKENS=512   LLM_MAX_INPUT_CHARS=8000
@@ -185,7 +209,7 @@ def get_llm_client():
     """
     Return an API client for the configured provider.
 
-    - For groq/gemini/openai: returns an OpenAI-compatible client
+    - For groq/gemini/openai/mercury: returns an OpenAI-compatible client
     - For claude: returns an anthropic.Anthropic client
     """
     info = get_provider_info()
@@ -208,7 +232,7 @@ def get_llm_client():
         print(f"[LLM] Spend cap: EUR {_MAX_SPEND:.2f} (set LLM_MAX_SPEND_EUR to change)")
         return client
 
-    # ── OpenAI-compatible providers (groq, gemini, openai) ──
+    # ── OpenAI-compatible providers (groq, gemini, openai, mercury) ──
     try:
         from openai import OpenAI
     except ImportError:
@@ -267,7 +291,10 @@ def _ask_anthropic(client, system_prompt, user_prompt, model, info):
 
 
 def _ask_openai_compat(client, system_prompt, user_prompt, model, info):
-    """Call an OpenAI-compatible chat completions API (Groq, Gemini, OpenAI)."""
+    """
+    Call an OpenAI-compatible chat completions API.
+    Used by Groq, Gemini, OpenAI, and Mercury (Inception).
+    """
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
