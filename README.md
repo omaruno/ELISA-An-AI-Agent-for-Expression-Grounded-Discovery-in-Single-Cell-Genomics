@@ -202,6 +202,10 @@ export OPENAI_API_KEY=your-key
 export LLM_PROVIDER=claude
 export ANTHROPIC_API_KEY=your-key
 export LLM_MAX_SPEND_EUR=5.0   # raise cap for Claude's higher pricing
+
+# Inception (Mercury)
+export LLM_PROVIDER=mercury
+export ANTHROPIC_API_KEY=your-key
 ```
 
 | Variable | Description | Default |
