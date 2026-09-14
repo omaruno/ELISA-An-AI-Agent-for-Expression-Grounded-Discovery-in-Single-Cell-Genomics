@@ -6,7 +6,7 @@ ELISA unifies scGPT expression embeddings with BioBERT-based semantic retrieval 
 The Agent is keep being updated based on the feedback recieved.
 
 Iam Currently looking for Job Opportunities, Post-Doc or Industry, feel free do drop me a message, omarcoser10@gmail.com
-> **Paper Submitted (Currently Under Review):** Coser O. — *ELISA: An Interpretable Hybrid Generative AI Agent for Expression-Grounded Discovery in Single-Cell Genomics.* .https://arxiv.org/abs/2603.11872
+> **Paper Published in Briefing in Bioinformatics:** Coser O. — *ELISA: An Interpretable Hybrid Generative AI Agent for Expression-Grounded Discovery in Single-Cell Genomics.* . https://doi.org/10.1093/bib/bbag501
 ---
 
 ## Quick Start (3-Step Pipeline)
