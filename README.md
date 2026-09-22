@@ -223,7 +223,7 @@ A built-in spending tracker with overestimated costs refuses calls once the limi
 
 ## Citation
 
-If you use ELISA in your research, please cite the arXiv or the preliminary version published at ICLR Workshop Generative AI in Genomics:
+If you use ELISA in your research, please cite the paper:
 
 ```@article{coser2026elisa,
   title={ELISA (Embedding-Linked Interactive Single-cell Agent): an interpretable hybrid generative Artificial Intelligence agent for expression-grounded discovery in single-cell genomics},
