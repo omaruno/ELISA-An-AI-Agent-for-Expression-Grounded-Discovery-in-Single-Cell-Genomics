@@ -4,7 +4,7 @@ An interpretable hybrid generative AI agent for expression-grounded discovery in
 
 ELISA unifies scGPT expression embeddings with BioBERT-based semantic retrieval and LLM-mediated interpretation for interactive single-cell atlas interrogation. An automatic query classifier routes inputs to gene marker scoring, semantic matching, or reciprocal rank fusion pipelines, while integrated modules perform pathway scoring, ligand–receptor interaction prediction, comparative analysis, and proportion estimation.
 The Agent is keep being updated based on the feedback recieved.
-
+If you interested using ELISA feel free to drop me an email for help: omarcoser10@gmail.com
 Iam Currently looking for Job Opportunities, Post-Doc or Industry, feel free do drop me a message, omarcoser10@gmail.com
 > **Paper Published in Briefing in Bioinformatics:** Coser O. — *ELISA: An Interpretable Hybrid Generative AI Agent for Expression-Grounded Discovery in Single-Cell Genomics.* . https://doi.org/10.1093/bib/bbag501
 ---
