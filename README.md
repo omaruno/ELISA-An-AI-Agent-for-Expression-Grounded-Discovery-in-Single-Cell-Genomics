@@ -7,6 +7,8 @@ The Agent is keep being updated based on the feedback recieved.
 
 If you interested using ELISA feel free to drop me an email for help: omarcoser10@gmail.com
 
+Video tutorial (sorry for the quality):https://www.youtube.com/watch?v=ZcyU2fu2Lnc
+
 Iam Currently looking for Job Opportunities, Post-Doc or Industry, feel free do drop me a message, omarcoser10@gmail.com
 > **Paper Published in Briefing in Bioinformatics:** Coser O. — *ELISA: An Interpretable Hybrid Generative AI Agent for Expression-Grounded Discovery in Single-Cell Genomics.* . https://doi.org/10.1093/bib/bbag501
 ---
