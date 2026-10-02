@@ -1,5 +1,12 @@
 # ELISA — Embedding-Linked Interactive Single-cell Agent
-
+<p align="center">
+  <a href="https://doi.org/10.1093/bib/bbag501"><img src="https://img.shields.io/badge/DOI-10.1093%2Fbib%2Fbbag501-b31b1b" alt="DOI"></a>
+  <img src="https://img.shields.io/badge/python-3.10+-blue" alt="python">
+  <img src="https://visitor-badge.laobi.icu/badge?page_id=omaruno.ELISA-An-AI-Agent-for-Expression-Grounded-Discovery-in-Single-Cell-Genomics" alt="visitors">
+  <img src="https://img.shields.io/github/license/omaruno/ELISA-An-AI-Agent-for-Expression-Grounded-Discovery-in-Single-Cell-Genomics" alt="license">
+  <img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome">
+  <a href="https://github.com/omaruno/ELISA-An-AI-Agent-for-Expression-Grounded-Discovery-in-Single-Cell-Genomics/stargazers"><img src="https://img.shields.io/github/stars/omaruno/ELISA-An-AI-Agent-for-Expression-Grounded-Discovery-in-Single-Cell-Genomics?style=social" alt="Stars"></a>
+</p>
 An interpretable hybrid generative AI agent for expression-grounded discovery in single-cell genomics.
 
 ELISA unifies scGPT expression embeddings with BioBERT-based semantic retrieval and LLM-mediated interpretation for interactive single-cell atlas interrogation. An automatic query classifier routes inputs to gene marker scoring, semantic matching, or reciprocal rank fusion pipelines, while integrated modules perform pathway scoring, ligand–receptor interaction prediction, comparative analysis, and proportion estimation.
