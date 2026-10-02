@@ -1,6 +1,6 @@
 # ELISA — Embedding-Linked Interactive Single-cell Agent
 <p align="center">
-  <a href="https://doi.org/10.1093/bib/bbag501"><img src="https://img.shields.io/badge/DOI-10.1093%2Fbib%2Fbbag501-b31b1b" alt="DOI"></a>
+<a href="https://polyformproject.org/licenses/noncommercial/1.0.0"><img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-orange" alt="license"></a>
   <img src="https://img.shields.io/badge/python-3.10+-blue" alt="python">
   <img src="https://visitor-badge.laobi.icu/badge?page_id=omaruno.ELISA-An-AI-Agent-for-Expression-Grounded-Discovery-in-Single-Cell-Genomics" alt="visitors">
   <img src="https://img.shields.io/github/license/omaruno/ELISA-An-AI-Agent-for-Expression-Grounded-Discovery-in-Single-Cell-Genomics" alt="license">
